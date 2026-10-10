@@ -1,6 +1,6 @@
 // File: api/index.js
 export default async function handler(req, res) {
-  const targetUrl = 'https://potential-funicular-opal.vercel.app/';
+  const targetUrl = 'https://k12online.vn/';
   
   try {
     // 1. Máy chủ Vercel tự tải web gốc (Không dính lỗi CORS, không cần proxy ngoài)
