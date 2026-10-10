@@ -1,5 +1,5 @@
 export default async function handler(req, res) {
-  const targetDomain = 'https://k12online.vn/';
+  const targetDomain = 'https://quangngai.k12online.vn';
   
   // 1. Bắt đường dẫn động (Ví dụ: /about, /css/style.css) thay vì chỉ tải trang chủ
   const targetUrl = targetDomain + req.url;
