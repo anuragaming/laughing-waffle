@@ -3,7 +3,7 @@ export const config = {
 };
 
 export default async function handler(req, res) {
-  const baseDomain = 'potential-funicular-opal.vercel.app';
+  const baseDomain = 'k12online.vn';
   
   const proxyHost = req.headers['x-forwarded-host'] || req.headers.host;
   const proxyDomain = 'https://' + proxyHost;
