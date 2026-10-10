@@ -1,32 +1,45 @@
-// File: api/index.js
 export default async function handler(req, res) {
-  const targetUrl = 'https://k12online.vn/';
+  const targetDomain = 'https://k12online.vn/';
   
+  // 1. Bắt đường dẫn động (Ví dụ: /about, /css/style.css) thay vì chỉ tải trang chủ
+  const targetUrl = targetDomain + req.url;
+
   try {
-    // 1. Máy chủ Vercel tự tải web gốc (Không dính lỗi CORS, không cần proxy ngoài)
     const response = await fetch(targetUrl);
-    let html = await response.text();
+    const contentType = response.headers.get('content-type') || '';
 
-    // 2. Đoạn mã đánh lừa (Ép tab luôn ở trạng thái visible)
-    const injectedScript = `
-      <script>
-        Object.defineProperty(document, 'visibilityState', { get: () => 'visible' });
-        Object.defineProperty(document, 'hidden', { get: () => false });
-        const originalAdd = document.addEventListener;
-        document.addEventListener = function(type, listener, options) {
-          if (type === 'visibilitychange') return; // Chặn theo dõi
-          return originalAdd.call(this, type, listener, options);
-        };
-      </script>
-    `;
+    // 2. Chỉ tiêm mã nếu file tải về là giao diện web (HTML)
+    if (contentType.includes('text/html')) {
+      let html = await response.text();
 
-    // 3. Tiêm mã vào trang gốc
-    html = html.replace('<head>', '<head>' + injectedScript);
+      const injectedScript = `
+        <script>
+          Object.defineProperty(document, 'visibilityState', { get: () => 'visible' });
+          Object.defineProperty(document, 'hidden', { get: () => false });
+          const originalAdd = document.addEventListener;
+          document.addEventListener = function(type, listener, options) {
+            if (type === 'visibilitychange') return; // Chặn theo dõi
+            return originalAdd.call(this, type, listener, options);
+          };
+        </script>
+      `;
 
-    // 4. Trả kết quả về trình duyệt
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.status(200).send(html);
+      // Tìm thẻ <head> (bất kể có thuộc tính gì) và nhét code vào
+      html = html.replace(/<head[^>]*>/i, match => match + injectedScript);
+
+      // 3. Viết lại toàn bộ link: Xóa tên miền gốc đi để bạn không bị văng ra ngoài khi click
+      html = html.replaceAll(targetDomain, '');
+
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.status(200).send(html);
+    } 
+    // 4. Nếu là các file hình ảnh, CSS, JS... thì giữ nguyên, trả thẳng về
+    else {
+      const buffer = await response.arrayBuffer();
+      res.setHeader('Content-Type', contentType);
+      res.status(200).send(Buffer.from(buffer));
+    }
   } catch (error) {
-    res.status(500).send('Lỗi máy chủ Vercel khi tải trang gốc.');
+    res.status(500).send('Lỗi máy chủ Proxy khi tải trang.');
   }
 }
