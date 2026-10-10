@@ -1,34 +1,36 @@
 export const config = {
-  api: { bodyParser: false } // Bắt buộc tắt để hỗ trợ truyền form Đăng nhập
+  api: { bodyParser: false } 
 };
 
 export default async function handler(req, res) {
   const baseDomain = 'k12online.vn/';
   
-  // 1. Kiểm tra xem người dùng đã được điều hướng tới tỉnh nào chưa (Đọc từ Cookie)
+  // Lấy tên miền web trung gian của bạn (vd: abc.vercel.app)
+  const proxyHost = req.headers['x-forwarded-host'] || req.headers.host;
+  const proxyDomain = 'https://' + proxyHost;
+
+  // Đọc Cookie xem bạn đang đăng nhập vào phân hệ tỉnh nào (vd: quangngai, hanoi,...)
   let targetHost = baseDomain;
   const cookieHeader = req.headers.cookie || '';
   const match = cookieHeader.match(/proxy_target_host=([^;]+)/);
-  if (match) {
-    targetHost = match[1]; // Vd: quangngai.potential...
-  }
+  if (match) targetHost = match[1];
 
   const targetDomain = 'https://' + targetHost;
   const targetUrl = targetDomain + req.url;
 
   try {
-    // Thu thập dữ liệu bạn nhập (Tài khoản/Mật khẩu) để gửi đi
     const buffers = [];
     for await (const chunk of req) { buffers.push(chunk); }
     const body = buffers.length ? Buffer.concat(buffers) : undefined;
 
-    // Chuẩn bị Header (Xóa host để vượt rào Vercel, xóa nén GZIP để dễ tiêm mã)
     const headers = { ...req.headers };
     delete headers.host;
     delete headers.referer;
     delete headers['accept-encoding']; 
+    
+    // Đánh lừa máy chủ gốc rằng request này đến từ chính nó để không bị chặn đăng nhập
+    if (headers.origin) headers.origin = targetDomain;
 
-    // Tải trang/Đăng nhập (Tắt tự chuyển hướng để tự xử lý)
     const response = await fetch(targetUrl, {
       method: req.method,
       headers: headers,
@@ -36,32 +38,25 @@ export default async function handler(req, res) {
       redirect: 'manual' 
     });
 
-    // Xử lý và giữ lại Cookie đăng nhập của server trả về
     let cookiesToSet = [];
     if (typeof response.headers.getSetCookie === 'function') {
-       const cookies = response.headers.getSetCookie();
-       // Xóa cờ Domain để Cookie có thể lưu được trên tên miền Vercel của bạn
-       cookiesToSet = cookies.map(c => c.replace(/Domain=[^;]+;?\s*/ig, ''));
+       cookiesToSet = response.headers.getSetCookie().map(c => c.replace(/Domain=[^;]+;?\s*/ig, ''));
     }
 
-    // 2. Bắt lệnh chuyển hướng khi đăng nhập thành công
+    // BƯỚC 1: BẮT LỆNH CHUYỂN HƯỚNG TỪ MÁY CHỦ (SERVER-SIDE)
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get('location');
       if (location) {
          const locUrl = new URL(location, targetDomain);
-         
-         // Nếu server đẩy về tên miền của tỉnh
          if (locUrl.hostname.includes(baseDomain)) {
-            // Lưu ngầm tên miền tỉnh đó vào Cookie
+            // Cập nhật Cookie phân hệ tỉnh
             cookiesToSet.push(`proxy_target_host=${locUrl.hostname}; Path=/; HttpOnly`);
             if (cookiesToSet.length > 0) res.setHeader('Set-Cookie', cookiesToSet);
             
-            // Bẻ lái trình duyệt giữ nguyên ở link web trung gian
-            res.writeHead(response.status, { Location: locUrl.pathname + locUrl.search });
+            // Ép bẻ lái trình duyệt trả về tên miền Vercel của bạn
+            res.writeHead(response.status, { Location: proxyDomain + locUrl.pathname + locUrl.search });
             return res.end();
          }
-         
-         // Nếu là chuyển hướng ngoài hệ thống (Vd: Login bằng Google)
          res.writeHead(response.status, { Location: location });
          return res.end();
       }
@@ -70,14 +65,13 @@ export default async function handler(req, res) {
     if (cookiesToSet.length > 0) res.setHeader('Set-Cookie', cookiesToSet);
     const contentType = response.headers.get('content-type') || '';
 
-    // 3. Tiêm mã và "Tẩy xóa" sạch sẽ dấu vết web gốc
     if (contentType.includes('text/html') || contentType.includes('application/javascript') || contentType.includes('application/json')) {
       let text = await response.text();
 
-      // Tiêm script ẩn danh vào thẻ Head
       if (contentType.includes('text/html')) {
         const injectedScript = `
           <script>
+            // Tắt theo dõi trạng thái thoát trang
             Object.defineProperty(document, 'visibilityState', { get: () => 'visible' });
             Object.defineProperty(document, 'hidden', { get: () => false });
             const originalAdd = document.addEventListener;
@@ -85,24 +79,41 @@ export default async function handler(req, res) {
               if (type === 'visibilitychange') return;
               return originalAdd.call(this, type, listener, options);
             };
+
+            // BƯỚC 2: CHẶN WEB GỐC DÙNG JAVASCRIPT ĐỂ ÉP CHUYỂN TRANG (CLIENT-SIDE)
+            const proxyDom = '${proxyDomain}';
+            const originalAssign = window.location.assign;
+            const originalReplace = window.location.replace;
+            
+            window.location.assign = function(url) {
+                if(typeof url === 'string') url = url.replace(/https:\\/\\/[a-zA-Z0-9-]+\\.?potential-funicular-opal\\.vercel\\.app/g, proxyDom);
+                return originalAssign.call(this, url);
+            };
+            window.location.replace = function(url) {
+                if(typeof url === 'string') url = url.replace(/https:\\/\\/[a-zA-Z0-9-]+\\.?potential-funicular-opal\\.vercel\\.app/g, proxyDom);
+                return originalReplace.call(this, url);
+            };
           </script>
         `;
         text = text.replace(/<head[^>]*>/i, match => match + injectedScript);
       }
 
-      // Xóa toàn bộ link chứa tên miền gốc HOẶC tên miền tỉnh để chống bị văng
+      // BƯỚC 3: THAY THẾ TOÀN BỘ TÊN MIỀN GỐC THÀNH TÊN MIỀN CỦA BẠN TRONG DỮ LIỆU
       const urlRegex = new RegExp(`https://[a-zA-Z0-9-]+\\.?${baseDomain.replace(/\./g, '\\.')}`, 'g');
-      text = text.replace(urlRegex, '');
+      text = text.replace(urlRegex, proxyDomain);
+
+      // BƯỚC 4: SỬA LỖI CÁC LINK BỊ MÃ HÓA TRONG JSON
+      const escapedUrlRegex = new RegExp(`https:\\\\/\\\\/[a-zA-Z0-9-]+\\.?${baseDomain.replace(/\./g, '\\.')}`, 'g');
+      text = text.replace(escapedUrlRegex, proxyDomain.replace(/\//g, '\\/'));
 
       res.setHeader('Content-Type', contentType);
       res.status(200).send(text);
     } else {
-      // Trả về file hình ảnh, giao diện y nguyên
       const buffer = await response.arrayBuffer();
       res.setHeader('Content-Type', contentType);
       res.status(200).send(Buffer.from(buffer));
     }
   } catch (error) {
-    res.status(500).send('Lỗi máy chủ Proxy trong quá trình đăng nhập.');
+    res.status(500).send('Lỗi máy chủ Proxy.');
   }
 }
