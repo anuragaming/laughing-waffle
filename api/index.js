@@ -8,7 +8,7 @@ export default async function handler(req, res) {
   const proxyHost = req.headers['x-forwarded-host'] || req.headers.host;
   const proxyDomain = 'https://' + proxyHost;
 
-  // 1. Xác định phân hệ (Tenant) từ Cookie
+  // 1. Kiểm tra Cookie xem đang ở phân hệ (tỉnh/trường) nào
   let targetHost = baseDomain;
   const cookieHeader = req.headers.cookie || '';
   const match = cookieHeader.match(/tenant_host=([^;]+)/);
@@ -24,20 +24,21 @@ export default async function handler(req, res) {
 
     const headers = { ...req.headers }; 
     
-    // --- [NÂNG CẤP TỐI QUAN TRỌNG]: Ngụy trang Header ---
-    // Xóa dấu vết của Vercel Proxy để K12 không bắt chuyển hướng báo lỗi
+    // --- FIX LỖI "TOO MANY REDIRECTS" Ở ĐÂY ---
+    // Xóa sạch mọi dấu vết Proxy để máy chủ K12 không phát hiện ra tên miền giả
     delete headers.host; 
-    delete headers['x-forwarded-host'];
+    delete headers.referer; 
+    delete headers['accept-encoding']; 
+    delete headers['x-forwarded-host'];   // Kẻ chủ mưu gây ra vòng lặp
     delete headers['x-forwarded-proto'];
     delete headers['x-forwarded-for'];
     delete headers['x-real-ip'];
-    delete headers['accept-encoding']; 
-
-    // Fake Origin và Referer cho chuẩn chỉ
+    delete headers['x-vercel-id'];
+    delete headers['x-vercel-ip-city'];
+    delete headers['x-vercel-ip-country'];
+    delete headers['x-vercel-forwarded-for'];
+    
     if (headers.origin) headers.origin = targetDomain; 
-    if (headers.referer) {
-        headers.referer = headers.referer.replace(proxyHost, targetHost);
-    }
 
     const response = await fetch(targetUrl, { 
       method: req.method, 
@@ -46,7 +47,7 @@ export default async function handler(req, res) {
       redirect: 'manual' 
     }); 
 
-    // 2. Chuyển tiếp Header trả về và gỡ khiên bảo mật
+    // 2. Chuyển tiếp Header và tháo gỡ khiên bảo mật gốc
     const headersToDrop = [
       'content-encoding', 'content-length', 'transfer-encoding', 'connection',
       'content-security-policy', 'content-security-policy-report-only', 
@@ -64,7 +65,7 @@ export default async function handler(req, res) {
       cookiesToSet = response.headers.getSetCookie().map(c => c.replace(/Domain=[^;]+;?\s*/ig, '')); 
     } 
 
-    // 3. XỬ LÝ CHUYỂN HƯỚNG HTTP (Bẻ lái & CHỐNG LẶP INFINITE LOOP)
+    // 3. XỬ LÝ CHUYỂN HƯỚNG HTTP VÀ CẮT VÒNG LẶP
     if (response.status >= 300 && response.status < 400) { 
       const location = response.headers.get('location'); 
       if (location) { 
@@ -72,22 +73,19 @@ export default async function handler(req, res) {
         try { locUrl = new URL(location, targetDomain); } catch (e) { locUrl = null; }
 
         if (locUrl && locUrl.hostname.includes(baseDomain)) { 
-          const targetPath = locUrl.pathname + locUrl.search;
-
-          // BỘ CHỐNG LẶP: Nếu K12 bắt chuyển hướng về đúng cái link đang gọi, ngắt ngay lập tức!
-          if (req.url === targetPath && targetHost === locUrl.hostname) {
-              console.log('🛡️ Đã chặn vòng lặp ERR_TOO_MANY_REDIRECTS!');
-              // Ép trả về mã 200 để ngắt lặp
-              res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-              return res.end('<h1>Proxy đã chặn 1 vòng lặp lỗi từ K12. Vui lòng F5 Tải lại trang!</h1>');
+          const newPath = locUrl.pathname + locUrl.search;
+          
+          // Phanh khẩn cấp: Nếu web cố Redirect về đúng URL hiện tại, ta bẻ gãy vòng lặp ngay
+          if (locUrl.hostname === targetHost && req.url === newPath) {
+               console.log("🛡️ Đã chặn một vòng lặp Redirect vô tận");
+               res.status(200).send('<html><body><h1>Đã xử lý chống kẹt Redirect. Hãy tải lại trang (F5).</h1></body></html>');
+               return res.end();
           }
 
-          // Cập nhật Cookie phân hệ một cách chính thống từ lệnh Redirect
-          cookiesToSet.push(`tenant_host=${locUrl.hostname}; Path=/; HttpOnly; Max-Age=86400; SameSite=Lax`); 
+          cookiesToSet.push(`tenant_host=${locUrl.hostname}; Path=/; HttpOnly; Max-Age=86400`); 
           if (cookiesToSet.length > 0) res.setHeader('Set-Cookie', cookiesToSet); 
           
-          const newLocation = proxyDomain + targetPath;
-          res.writeHead(response.status, { Location: newLocation }); 
+          res.writeHead(response.status, { Location: proxyDomain + newPath }); 
           return res.end(); 
         } 
         res.writeHead(response.status, { Location: location }); 
@@ -95,7 +93,7 @@ export default async function handler(req, res) {
       } 
     } 
 
-    // 4. KIỂM SOÁT HTML, JSON, JAVASCRIPT
+    // 4. THAY MÁU TOÀN BỘ LINK TRONG HTML, JSON, JAVASCRIPT
     const contentType = response.headers.get('content-type') || ''; 
     const isTextContent = contentType.includes('text/') || 
                           contentType.includes('application/json') || 
@@ -104,10 +102,11 @@ export default async function handler(req, res) {
 
     if (isTextContent) { 
       let text = await response.text(); 
+      let foundTenant = null; 
 
-      // Ép tên miền K12 thành Proxy (ĐÃ GỠ BỎ tính năng bắt Cookie tự động gây lặp)
       const regexSub = new RegExp(`https:\\\\?/\\\\?/([a-zA-Z0-9-]+)\\.${baseDomain.replace(/\./g, '\\.')}`, 'g'); 
-      text = text.replace(regexSub, match => { 
+      text = text.replace(regexSub, (match, subdomain) => { 
+        foundTenant = subdomain + '.' + baseDomain; 
         return match.includes('\\/') ? proxyDomain.replace(/\//g, '\\/') : proxyDomain; 
       }); 
 
@@ -116,41 +115,40 @@ export default async function handler(req, res) {
         return match.includes('\\/') ? proxyDomain.replace(/\//g, '\\/') : proxyDomain; 
       }); 
 
+      if (foundTenant && foundTenant !== targetHost) { 
+        cookiesToSet.push(`tenant_host=${foundTenant}; Path=/; HttpOnly; Max-Age=86400`); 
+      } 
       if (cookiesToSet.length > 0) res.setHeader('Set-Cookie', cookiesToSet); 
 
-      // 5. BƠM MÃ JS AN TOÀN (Không làm đơ nút bấm)
+      // 5. BƠM MÃ JS BẢO VỆ
       if (contentType.includes('text/html')) {
         text = text.replace(/<script[^>]*src=["'][^"']*(adsbygoogle|popunder|adzone|doubleclick|adsystem)[^"']*["'][^>]*>[\s\S]*?<\/script>/gi, '');
 
         const injectedScript = `
           <script>
-            // --- 1. CHỐNG PHÁT HIỆN CHUYỂN TAB ---
+            // Chống phát hiện chuyển tab an toàn tuyệt đối
             Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
             Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
-            
             const blockVisibility = (e) => { e.stopImmediatePropagation(); e.stopPropagation(); };
             window.addEventListener('visibilitychange', blockVisibility, true);
             document.addEventListener('visibilitychange', blockVisibility, true);
 
-            // --- 2. CHẶN POPUP QUẢNG CÁO RÁC ---
+            // Chặn popup quảng cáo, nhưng cho phép mở tài liệu
             const originalWindowOpen = window.open;
             window.open = function(url, name, specs) {
                 if (typeof url === 'string' && /(ads|popunder|adsystem|track|doubleclick)/i.test(url)) {
-                    console.log('🛡️ Đã chặn popup quảng cáo!');
                     return null;
                 }
                 return originalWindowOpen.apply(this, arguments);
             };
 
-            // --- 3. TIÊU DIỆT SCRIPT QUẢNG CÁO CHÈN ĐỘNG ---
+            // Tiêu diệt script quảng cáo chạy ẩn
             const observer = new MutationObserver(mutations => {
               mutations.forEach(mutation => {
                 mutation.addedNodes.forEach(node => {
-                  if (node.tagName === 'SCRIPT' && node.src) {
-                    if (/(adsbygoogle|popunder|adzone|adsystem)/i.test(node.src)) {
+                  if (node.tagName === 'SCRIPT' && node.src && /(adsbygoogle|popunder|adzone|adsystem)/i.test(node.src)) {
                       node.type = 'javascript/blocked'; 
                       node.remove();
-                    }
                   }
                 });
               });
@@ -163,7 +161,6 @@ export default async function handler(req, res) {
 
       res.status(response.status).send(text); 
     } else { 
-      // Xử lý Ảnh, Video
       if (cookiesToSet.length > 0) res.setHeader('Set-Cookie', cookiesToSet); 
       const buffer = await response.arrayBuffer(); 
       res.status(response.status).send(Buffer.from(buffer)); 
