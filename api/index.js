@@ -8,7 +8,7 @@ export default async function handler(req, res) {
   const proxyHost = req.headers['x-forwarded-host'] || req.headers.host;
   const proxyDomain = 'https://' + proxyHost;
 
-  // 1. Kiểm tra Cookie xem bạn đang ở phân hệ quản lý nào
+  // 1. Kiểm tra Cookie
   let targetHost = baseDomain;
   const cookieHeader = req.headers.cookie || '';
   const match = cookieHeader.match(/tenant_host=([^;]+)/);
@@ -35,7 +35,7 @@ export default async function handler(req, res) {
       redirect: 'manual' 
     }); 
 
-    // 2. Chuyển tiếp Header nhưng TƯỚC BỎ các lá chắn bảo mật của web gốc
+    // 2. Chuyển tiếp Header và vô hiệu hóa rào cản bảo mật
     const headersToDrop = [
       'content-encoding', 'content-length', 'transfer-encoding', 'connection',
       'content-security-policy', 'content-security-policy-report-only', 
@@ -53,37 +53,26 @@ export default async function handler(req, res) {
       cookiesToSet = response.headers.getSetCookie().map(c => c.replace(/Domain=[^;]+;?\s*/ig, '')); 
     } 
 
-    // 3. XỬ LÝ CHUYỂN HƯỚNG KHI ĐĂNG NHẬP (HTTP 3xx) - Đã nâng cấp
+    // 3. XỬ LÝ CHUYỂN HƯỚNG HTTP (Login)
     if (response.status >= 300 && response.status < 400) { 
       const location = response.headers.get('location'); 
       if (location) { 
-        // Phân tích URL đích đến dù nó là đường dẫn tuyệt đối hay tương đối
         let locUrl;
-        try {
-            locUrl = new URL(location, targetDomain); 
-        } catch (e) {
-            locUrl = null;
-        }
+        try { locUrl = new URL(location, targetDomain); } catch (e) { locUrl = null; }
 
-        // Nếu hệ thống đẩy về một trang thuộc K12 (ví dụ: chuyển sang quangngai.k12...)
         if (locUrl && locUrl.hostname.includes(baseDomain)) { 
-          // Lưu ngầm phân hệ mới vào cookie
           cookiesToSet.push(`tenant_host=${locUrl.hostname}; Path=/; HttpOnly; Max-Age=86400`); 
           if (cookiesToSet.length > 0) res.setHeader('Set-Cookie', cookiesToSet); 
-          
-          // Bẻ lái lệnh chuyển hướng về lại tên miền Proxy (tawny.vercel.app)
           const newLocation = proxyDomain + locUrl.pathname + locUrl.search;
           res.writeHead(response.status, { Location: newLocation }); 
           return res.end(); 
         } 
-        
-        // Thoát ra trang ngoài (ví dụ Google) thì để yên
         res.writeHead(response.status, { Location: location }); 
         return res.end(); 
       } 
     } 
 
-    // 4. KIỂM SOÁT TOÀN DIỆN: HTML, JSON và file JAVASCRIPT
+    // 4. KIỂM SOÁT HTML, JSON, JS
     const contentType = response.headers.get('content-type') || ''; 
     const isTextContent = contentType.includes('text/') || 
                           contentType.includes('application/json') || 
@@ -112,7 +101,7 @@ export default async function handler(req, res) {
       } 
       if (cookiesToSet.length > 0) res.setHeader('Set-Cookie', cookiesToSet); 
 
-      // 5. Bơm mã chống theo dõi và cùm chân Client (ĐÃ GỠ BỎ BEFOREUNLOAD)
+      // 5. BƠM MÃ ĐÃ ĐƯỢC FIX LỖI NÚT BẤM
       if (contentType.includes('text/html')) {
         text = text.replace(/<script[^>]*src=["'][^"']*(adsbygoogle|popunder|adzone|doubleclick|adsystem)[^"']*["'][^>]*>[\s\S]*?<\/script>/gi, '');
 
@@ -127,10 +116,17 @@ export default async function handler(req, res) {
               return originalAdd.call(this, type, listener, options);
             };
 
-            // --- 2. CHẶN POPUP QUẢNG CÁO ---
-            window.open = () => null; 
+            // --- 2. CHẶN POPUP QUẢNG CÁO THÔNG MINH (Bảo tồn nút mở tài liệu/bài thi) ---
+            const originalWindowOpen = window.open;
+            window.open = function(url, name, specs) {
+                if (typeof url === 'string' && ['ads', 'popunder', 'adsystem', 'track'].some(kw => url.toLowerCase().includes(kw))) {
+                    console.log('🛡️ Đã chặn quảng cáo popup!');
+                    return null;
+                }
+                return originalWindowOpen.apply(this, arguments);
+            };
 
-            // --- 3. THEO DÕI VÀ XÓA SCRIPT QUẢNG CÁO ẨN ---
+            // --- 3. XÓA SCRIPT QUẢNG CÁO ẨN ---
             const observer = new MutationObserver(mutations => {
               mutations.forEach(mutation => {
                 mutation.addedNodes.forEach(node => {
@@ -144,45 +140,62 @@ export default async function handler(req, res) {
             });
             observer.observe(document.documentElement, { childList: true, subtree: true });
 
-            // --- 4. BẮT CÓC CÁC SỰ KIỆN CLICK & FETCH NGẦM ---
+            // --- 4. BẢO VỆ SPA: CHO PHÉP BẤM NÚT MƯỢT MÀ ---
             const proxyDom = "${proxyDomain}";
             
-            document.addEventListener('click', function(e) {
-                const link = e.target.closest('a');
-                if (link && link.href) {
-                    try {
-                        const url = new URL(link.href);
-                        if (url.hostname.includes('k12online.vn')) {
-                            e.preventDefault(); 
-                            document.cookie = "tenant_host=" + url.hostname + "; path=/; max-age=86400";
-                            window.location.href = proxyDom + url.pathname + url.search;
-                        }
-                    } catch(err) {}
-                }
-            }, true); 
-
-            const originalFetch = window.fetch;
-            window.fetch = async function() {
-                if (typeof arguments[0] === 'string' && arguments[0].includes('k12online.vn')) {
-                    try {
-                        const u = new URL(arguments[0]);
-                        document.cookie = "tenant_host=" + u.hostname + "; path=/; max-age=86400";
-                        arguments[0] = proxyDom + u.pathname + u.search;
-                    } catch(e){}
-                }
-                return originalFetch.apply(this, arguments);
-            };
-
-            const originalXhrOpen = XMLHttpRequest.prototype.open;
-            XMLHttpRequest.prototype.open = function(method, url) {
+            // A. Đánh chặn History API (Cách React/Vue chuyển trang nội bộ)
+            const originalPushState = history.pushState;
+            history.pushState = function(state, unused, url) {
+                let newArgs = Array.prototype.slice.call(arguments);
                 if (typeof url === 'string' && url.includes('k12online.vn')) {
                     try {
-                        const u = new URL(url);
+                        const u = new URL(url, window.location.origin);
                         document.cookie = "tenant_host=" + u.hostname + "; path=/; max-age=86400";
-                        url = proxyDom + u.pathname + u.search;
+                        newArgs[2] = proxyDom + u.pathname + u.search;
+                    } catch(e) {}
+                }
+                return originalPushState.apply(this, newArgs);
+            };
+
+            const originalReplaceState = history.replaceState;
+            history.replaceState = function(state, unused, url) {
+                let newArgs = Array.prototype.slice.call(arguments);
+                if (typeof url === 'string' && url.includes('k12online.vn')) {
+                    try {
+                        const u = new URL(url, window.location.origin);
+                        document.cookie = "tenant_host=" + u.hostname + "; path=/; max-age=86400";
+                        newArgs[2] = proxyDom + u.pathname + u.search;
+                    } catch(e) {}
+                }
+                return originalReplaceState.apply(this, newArgs);
+            };
+
+            // B. Đánh chặn ngầm Fetch API (Fix lỗi Object Request)
+            const originalFetch = window.fetch;
+            window.fetch = async function(...args) {
+                let newArgs = Array.prototype.slice.call(args);
+                if (newArgs[0] && typeof newArgs[0] === 'string' && newArgs[0].includes('k12online.vn')) {
+                    try {
+                        const u = new URL(newArgs[0], window.location.origin);
+                        document.cookie = "tenant_host=" + u.hostname + "; path=/; max-age=86400";
+                        newArgs[0] = proxyDom + u.pathname + u.search;
                     } catch(e){}
                 }
-                return originalXhrOpen.apply(this, [method, url, ...Array.prototype.slice.call(arguments, 2)]);
+                return originalFetch.apply(this, newArgs);
+            };
+
+            // C. Đánh chặn ngầm XHR (Ajax)
+            const originalXhrOpen = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function(method, url) {
+                let newArgs = Array.prototype.slice.call(arguments);
+                if (typeof url === 'string' && url.includes('k12online.vn')) {
+                    try {
+                        const u = new URL(url, window.location.origin);
+                        document.cookie = "tenant_host=" + u.hostname + "; path=/; max-age=86400";
+                        newArgs[1] = proxyDom + u.pathname + u.search;
+                    } catch(e){}
+                }
+                return originalXhrOpen.apply(this, newArgs);
             };
           </script>
         `;
