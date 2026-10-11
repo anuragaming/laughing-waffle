@@ -1,5 +1,8 @@
 export const config = {
-  api: { bodyParser: false }
+  api: { 
+    bodyParser: false,
+    externalResolver: true // Báo cho Vercel biết request này sẽ được xử lý ra bên ngoài
+  }
 };
 
 export default async function handler(req, res) {
@@ -7,7 +10,7 @@ export default async function handler(req, res) {
   const proxyHost = req.headers['x-forwarded-host'] || req.headers.host;
   const proxyDomain = 'https://' + proxyHost;
 
-  // 1. Kiểm tra Cookie
+  // 1. Kiểm tra Cookie xác định Target Host
   let targetHost = baseDomain;
   const cookieHeader = req.headers.cookie || '';
   const match = cookieHeader.match(/tenant_host=([^;]+)/);
@@ -19,6 +22,10 @@ export default async function handler(req, res) {
   const prefixMatch = req.url.match(/^\/([a-zA-Z0-9-]+)(?=\/)/);
   const tenantPrefix = prefixMatch ? prefixMatch[0] : ''; 
 
+  // Tạo bộ đếm giờ (Timeout) để chống treo API. Ngắt sau 8.5 giây (Vercel free max 10s)
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 8500);
+
   try {
     const buffers = [];
     for await (const chunk of req) { buffers.push(chunk); }
@@ -26,26 +33,26 @@ export default async function handler(req, res) {
 
     const headers = { ...req.headers }; 
     
-    delete headers.host; 
-    delete headers.referer; 
-    delete headers['accept-encoding']; 
-    delete headers['x-forwarded-host'];
-    delete headers['x-forwarded-proto'];
-    delete headers['x-forwarded-for'];
-    delete headers['x-real-ip'];
-    delete headers['x-vercel-id'];
-    delete headers['x-vercel-ip-city'];
-    delete headers['x-vercel-ip-country'];
-    delete headers['x-vercel-forwarded-for'];
+    // Xóa các headers gây nhiễu
+    const headersToRemove = [
+      'host', 'referer', 'accept-encoding', 'x-forwarded-host', 
+      'x-forwarded-proto', 'x-forwarded-for', 'x-real-ip', 
+      'x-vercel-id', 'x-vercel-ip-city', 'x-vercel-ip-country', 'x-vercel-forwarded-for'
+    ];
+    headersToRemove.forEach(h => delete headers[h]);
     
     if (headers.origin) headers.origin = targetDomain; 
 
+    // Thực hiện Fetch với Abort Signal chống treo
     const response = await fetch(targetUrl, { 
       method: req.method, 
       headers: headers, 
       body: body, 
-      redirect: 'manual' 
+      redirect: 'manual',
+      signal: controller.signal 
     }); 
+    
+    clearTimeout(timeoutId); // Hủy bộ đếm giờ nếu fetch thành công
 
     const headersToDrop = [
       'content-encoding', 'content-length', 'transfer-encoding', 'connection',
@@ -64,7 +71,7 @@ export default async function handler(req, res) {
       cookiesToSet = response.headers.getSetCookie().map(c => c.replace(/Domain=[^;]+;?\s*/ig, '')); 
     } 
 
-    // 2. XỬ LÝ CHUYỂN HƯỚNG
+    // 2. XỬ LÝ CHUYỂN HƯỚNG (REDIRECT)
     if (response.status >= 300 && response.status < 400) { 
       const location = response.headers.get('location'); 
       if (location) { 
@@ -99,33 +106,38 @@ export default async function handler(req, res) {
       } 
     } 
 
-    // 3. XỬ LÝ TEXT (HTML, JSON, JS, CSS)
+    // 3. PHÂN LOẠI CONTENT TYPE
     const contentType = response.headers.get('content-type') || ''; 
     const isTextContent = contentType.includes('text/') || 
                           contentType.includes('application/json') || 
                           contentType.includes('javascript') ||
                           contentType.includes('application/x-javascript');
 
+    if (cookiesToSet.length > 0) res.setHeader('Set-Cookie', cookiesToSet); 
+
     if (isTextContent) { 
       let text = await response.text(); 
-      let foundTenant = null; 
+      
+      // Chỉ can thiệp thay thế chuỗi (Replace) nếu là HTML hoặc JSON để tránh lỗi hỏng file JS/CSS
+      if (contentType.includes('text/html') || contentType.includes('application/json')) {
+        let foundTenant = null; 
+        const regexSub = new RegExp(`https:\\\\?/\\\\?/([a-zA-Z0-9-]+)\\.${baseDomain.replace(/\./g, '\\.')}`, 'g'); 
+        text = text.replace(regexSub, (match, subdomain) => { 
+          foundTenant = subdomain + '.' + baseDomain; 
+          return match.includes('\\/') ? proxyDomain.replace(/\//g, '\\/') : proxyDomain; 
+        }); 
 
-      const regexSub = new RegExp(`https:\\\\?/\\\\?/([a-zA-Z0-9-]+)\\.${baseDomain.replace(/\./g, '\\.')}`, 'g'); 
-      text = text.replace(regexSub, (match, subdomain) => { 
-        foundTenant = subdomain + '.' + baseDomain; 
-        return match.includes('\\/') ? proxyDomain.replace(/\//g, '\\/') : proxyDomain; 
-      }); 
+        const regexRoot = new RegExp(`https:\\\\?/\\\\?/${baseDomain.replace(/\./g, '\\.')}`, 'g'); 
+        text = text.replace(regexRoot, match => { 
+          return match.includes('\\/') ? proxyDomain.replace(/\//g, '\\/') : proxyDomain; 
+        }); 
 
-      const regexRoot = new RegExp(`https:\\\\?/\\\\?/${baseDomain.replace(/\./g, '\\.')}`, 'g'); 
-      text = text.replace(regexRoot, match => { 
-        return match.includes('\\/') ? proxyDomain.replace(/\//g, '\\/') : proxyDomain; 
-      }); 
+        if (foundTenant && foundTenant !== targetHost) { 
+          res.setHeader('Set-Cookie', [...cookiesToSet, `tenant_host=${foundTenant}; Path=/; HttpOnly; Max-Age=86400`]); 
+        } 
+      }
 
-      if (foundTenant && foundTenant !== targetHost) { 
-        cookiesToSet.push(`tenant_host=${foundTenant}; Path=/; HttpOnly; Max-Age=86400`); 
-      } 
-      if (cookiesToSet.length > 0) res.setHeader('Set-Cookie', cookiesToSet); 
-
+      // Xử lý riêng cho giao diện HTML
       if (contentType.includes('text/html')) {
         if (tenantPrefix) {
           const relativePathRegex = /(href|action|src)=(["'])(\/(?:page|LMS|module|api|assets)[^"']*)/gi;
@@ -150,41 +162,28 @@ export default async function handler(req, res) {
                 if (typeof url === 'string' && /(ads|popunder|adsystem|track|doubleclick)/i.test(url)) return null;
                 return originalWindowOpen.apply(this, arguments);
             };
-
-            const observer = new MutationObserver(mutations => {
-              mutations.forEach(mutation => {
-                mutation.addedNodes.forEach(node => {
-                  if (node.tagName === 'SCRIPT' && node.src && /(adsbygoogle|popunder|adzone|adsystem)/i.test(node.src)) {
-                      node.type = 'javascript/blocked'; node.remove();
-                  }
-                });
-              });
-            });
-            observer.observe(document.documentElement, { childList: true, subtree: true });
           </script>
         `;
         text = text.replace(/<head[^>]*>/i, match => match + injectedScript);
       }
 
-      res.status(response.status).send(text); 
+      return res.status(response.status).send(text); 
     } else { 
-      // 4. XỬ LÝ FILE NHỊ PHÂN (ẢNH, VIDEO, TÀI LIỆU...) BẰNG STREAMING CỰC NHANH
-      if (cookiesToSet.length > 0) res.setHeader('Set-Cookie', cookiesToSet); 
-      res.status(response.status);
-
-      if (response.body) {
-        // Truyền trực tiếp dữ liệu thành từng mảnh nhỏ ngay khi nhận được
-        for await (const chunk of response.body) {
-          res.write(chunk);
-        }
-        return res.end();
-      } else {
-        return res.end();
-      }
+      // 4. XỬ LÝ FILE NHỊ PHÂN AN TOÀN TRÊN VERCEL SERVERLESS
+      const arrayBuffer = await response.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      return res.status(response.status).send(buffer);
     } 
 
   } catch (error) { 
+    clearTimeout(timeoutId);
+    
+    // Nếu lỗi do hết 8.5 giây chờ
+    if (error.name === 'AbortError') {
+      return res.status(504).json({ error: "Máy chủ K12Online phản hồi quá chậm (Timeout). Vui lòng thử lại." });
+    }
+    
     console.error("Proxy Error:", error);
-    res.status(500).send('Lỗi máy chủ Proxy Vercel.'); 
+    return res.status(500).send('Lỗi máy chủ Proxy Vercel.'); 
   } 
 }
