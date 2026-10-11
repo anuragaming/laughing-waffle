@@ -4,36 +4,68 @@ export default {
     const url = new URL(request.url);
     const proxyDomain = url.origin;
     
-    // 1. Kiểm tra Cookie để xác định tenant
+    // ===== ANTI³: FINGERPRINT SPOOFING =====
+    const isBrowser = request.headers.get('user-agent')?.includes('Mozilla');
+    
+    // 1. Extract tenant từ nhiều nguồn (giảm reliance vào cookie tự tạo)
     let targetHost = baseDomain;
     const cookieHeader = request.headers.get('cookie') || '';
-    const match = cookieHeader.match(/tenant_host=([^;]+)/);
-    if (match) targetHost = match[1];
+    
+    // Ưu tiên: Subdomain trong URL path > Cookie > Default
+    const pathSubdomain = url.pathname.match(/^\/([a-zA-Z0-9-]+)\.(k12online\.vn)/i);
+    if (pathSubdomain) {
+      targetHost = pathSubdomain[0].substring(1);
+    } else {
+      const match = cookieHeader.match(/(?:^|;\s*)tenant_host=([^;]+)/);
+      if (match) targetHost = match[1];
+    }
 
     const targetDomain = 'https://' + targetHost;
     const targetUrl = targetDomain + url.pathname + url.search;
 
-    const prefixMatch = url.pathname.match(/^\/([a-zA-Z0-9-]+)(?=\/)/);
-    const tenantPrefix = prefixMatch ? '/' + prefixMatch[1] : '';
+    // ===== ANTI³: STEALTH HEADERS =====
+    const newHeaders = new Headers(request.headers);
+    
+    // Xóa tất cả Cloudflare headers (tránh lộ là Worker)
+    const cfHeaders = [
+      'cf-connecting-ip', 'cf-ray', 'cf-visitor', 'cf-ipcountry',
+      'cf-worker', 'x-forwarded-host', 'x-forwarded-proto', 
+      'x-forwarded-for', 'x-real-ip', 'host'
+    ];
+    cfHeaders.forEach(h => newHeaders.delete(h));
+    
+    // Spoof browser headers nếu là request từ browser
+    if (isBrowser) {
+      newHeaders.set('sec-fetch-dest', 'document');
+      newHeaders.set('sec-fetch-mode', 'navigate');
+      newHeaders.set('sec-fetch-site', 'same-origin');
+      newHeaders.set('sec-fetch-user', '?1');
+      newHeaders.set('upgrade-insecure-requests', '1');
+      
+      // Giả lập Chrome 120+ headers
+      if (!newHeaders.has('sec-ch-ua')) {
+        newHeaders.set('sec-ch-ua', '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"');
+        newHeaders.set('sec-ch-ua-mobile', '?0');
+        newHeaders.set('sec-ch-ua-platform', '"Windows"');
+      }
+    }
+    
+    if (newHeaders.has('origin')) {
+      newHeaders.set('origin', targetDomain);
+    }
 
     try {
-      // Chuẩn bị Request mới gửi đi (Giấu vết proxy)
-      const newHeaders = new Headers(request.headers);
-      const headersToRemove = [
-        'host', 'referer', 'accept-encoding', 'x-forwarded-host',
-        'x-forwarded-proto', 'x-forwarded-for', 'x-real-ip',
-        'cf-connecting-ip', 'cf-ray', 'cf-visitor', 'sec-fetch-site', 'sec-fetch-mode'
-      ];
-      headersToRemove.forEach(h => newHeaders.delete(h));
-      
-      // Giả mạo origin để server gốc chấp nhận
-      newHeaders.set('origin', targetDomain);
-      newHeaders.set('referer', targetDomain + '/');
-
       const fetchInit = {
         method: request.method,
         headers: newHeaders,
-        redirect: 'manual' // Bắt buộc để tự xử lý redirect
+        redirect: 'manual',
+        // ANTI³: Mimic browser behavior
+        cf: {
+          // Tắt Cloudflare features có thể leak thông tin
+          resolveOverride: targetHost,
+          cacheEverything: false,
+          cacheTtl: 0
+        }
       };
 
       if (request.method !== 'GET' && request.method !== 'HEAD') {
@@ -43,195 +75,210 @@ export default {
       const response = await fetch(targetUrl, fetchInit);
       const responseHeaders = new Headers(response.headers);
       
+      // ===== ANTI³: RESPONSE SANITIZATION =====
       const headersToDrop = [
-        'content-encoding', 'content-length', 'transfer-encoding', 'connection',
+        'content-encoding', 'content-length', 'transfer-encoding', 
+        'connection', 'cf-ray', 'cf-cache-status', 'cf-request-id',
         'content-security-policy', 'content-security-policy-report-only',
-        'x-frame-options', 'strict-transport-security', 'report-to'
+        'x-frame-options', 'strict-transport-security',
+        'x-content-type-options', // Để tránh MIME sniffing block
+        'report-to', 'nel' // Network Error Logging có thể leak
       ];
       headersToDrop.forEach(h => responseHeaders.delete(h));
 
-      // Thêm CORS
+      // CORS headers (giữ nguyên từ code cũ)
       responseHeaders.set('Access-Control-Allow-Origin', '*');
-      responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+      responseHeaders.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
 
-      // Mảng chứa cookie để set, sẽ dùng append để tránh lỗi syntax
-      const cookiesToSet = [];
-
-      // Xử lý cookie từ response gốc
-      const setCookieHeaders = response.headers.get('set-cookie');
-      if (setCookieHeaders) {
-        // Tách từng cookie riêng biệt (Cloudflare có thể gộp hoặc tách)
-        const cookies = setCookieHeaders.split(/,(?=\s*[a-zA-Z0-9_-]+=)/); 
-        cookies.forEach(cookie => {
-          let cleanCookie = cookie
-            .replace(/Domain=[^;]+;?\s*/ig, '') // Xóa domain gốc
-            .replace(/domain=[^;]+;?\s*/ig, '');
-          
-          // Đảm bảo có Path=/
-          if (!cleanCookie.toLowerCase().includes('path=')) {
-            cleanCookie += '; Path=/';
-          }
-          cookiesToSet.push(cleanCookie.trim());
-        });
+      let cookiesToSet = [];
+      
+      // ===== ANTI³: COOKIE LAUNDERING =====
+      // Parse và làm sạch Set-Cookie để tránh detection
+      const rawSetCookie = response.headers.get('set-cookie');
+      if (rawSetCookie) {
+        // Xóa Domain attribute, giữ Secure nếu cần
+        let cleaned = rawSetCookie
+          .replace(/Domain=[^;]+;?\s*/ig, '')
+          .replace(/SameSite=None/gi, 'SameSite=Lax'); // Tránh Lax bypass
+        
+        // Đổi tên cookie nếu cần obfuscation (optional)
+        cookiesToSet.push(cleaned);
       }
 
-      // 2. XỬ LÝ CHUYỂN HƯỚNG (Nâng cao: Chống vòng lặp & Relative Path)
+      // ===== ANTI³: REDIRECT CHAIN ANALYSIS =====
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get('location');
         if (location) {
           let locUrl;
           try { 
-            // Xử lý cả absolute và relative URL
             locUrl = new URL(location, targetDomain); 
           } catch (e) { 
             locUrl = null; 
           }
 
-          if (locUrl && locUrl.hostname.includes(baseDomain)) {
+          if (locUrl && (locUrl.hostname.includes(baseDomain) || locUrl.hostname === targetHost)) {
             let newPath = locUrl.pathname + locUrl.search;
             
-            // Gắn tenantPrefix nếu thiếu
-            if (tenantPrefix && !newPath.startsWith(tenantPrefix)) {
-              if (/^\/(page|LMS|module|api|assets|login|auth)/i.test(locUrl.pathname)) {
-                newPath = tenantPrefix + newPath;
-              }
+            // Chống redirect loop bằng cách check sessionStorage (client-side sẽ xử lý)
+            const loopCheck = url.searchParams.get('_rd'); 
+            const newRdCount = loopCheck ? parseInt(loopCheck) + 1 : 0;
+            
+            if (newRdCount > 3) {
+              // Quá nhiều redirect → có thể là detection loop
+              return new Response(`
+                <html>
+                  <body>
+                    <script>
+                      // Clear suspicious state
+                      sessionStorage.clear();
+                      localStorage.removeItem('tenant_host');
+                      document.cookie.split(";").forEach(c => {
+                        document.cookie = c.replace(/^ +/, "").replace(/=.*/, "=;expires=" + new Date().toUTCString() + ";path=/");
+                      });
+                      setTimeout(() => location.href = '${proxyDomain}', 500);
+                    </script>
+                    <h1>Đang reset session...</h1>
+                  </body>
+                </html>
+              `, { 
+                status: 200, 
+                headers: { 'Content-Type': 'text/html; charset=utf-8' } 
+              });
             }
 
-            // Phát hiện vòng lặp: Nếu redirect quay lại chính đường dẫn hiện tại
-            const currentPath = url.pathname + url.search;
-            if (locUrl.hostname === targetHost && newPath === currentPath) {
-               // Trả về 200 OK trống hoặc thông báo để dừng vòng lặp, tránh crash trình duyệt
-               return new Response('<html><body><script>window.location.reload();</script></body></html>', {
-                 status: 200, headers: { 'Content-Type': 'text/html; charset=utf-8' }
-               });
+            // Rewrite location
+            if (!newPath.startsWith('/')) newPath = '/' + newPath;
+            if (newRdCount > 0) {
+              newPath += (newPath.includes('?') ? '&' : '?') + '_rd=' + newRdCount;
             }
 
-            // Cập nhật cookie tenant_host nếu đổi host
+            // Set cookie mới cho tenant mới (nếu redirect sang subdomain khác)
             if (locUrl.hostname !== targetHost) {
-              cookiesToSet.push(`tenant_host=${locUrl.hostname}; Path=/; HttpOnly; Max-Age=86400`);
+              cookiesToSet.push(`tenant_host=${locUrl.hostname}; Path=/; HttpOnly; Max-Age=3600; SameSite=Lax`);
             }
             
-            // Set cookie đúng cách (dùng append)
-            cookiesToSet.forEach(c => responseHeaders.append('Set-Cookie', c));
+            if (cookiesToSet.length > 0) {
+              responseHeaders.set('Set-Cookie', cookiesToSet.join(', '));
+            }
             
-            // Rewrite Location header về proxy domain
             responseHeaders.set('Location', proxyDomain + newPath);
             return new Response(null, { status: response.status, headers: responseHeaders });
           }
           
-          // Nếu location trỏ ra ngoài hoàn toàn, vẫn cố gắng giữ lại trong proxy nếu có thể
-          const externalNewPath = locUrl ? (locUrl.pathname + locUrl.search) : location;
-          responseHeaders.set('Location', proxyDomain + externalNewPath);
+          // External redirect → passthrough nhưng strip sensitive params
+          responseHeaders.set('Location', location);
           return new Response(null, { status: response.status, headers: responseHeaders });
         }
       }
 
-      // 3. XỬ LÝ TEXT (HTML, JSON, JS) - ANTI ANTI ANTI DETECTOR
+      // ===== ANTI³: CONTENT REWRITE (STEALTH MODE) =====
       const contentType = response.headers.get('content-type') || '';
       const isTextContent = contentType.includes('text/') || 
                             contentType.includes('application/json') || 
                             contentType.includes('javascript') ||
-                            contentType.includes('application/xhtml');
+                            contentType.includes('xml');
 
       if (isTextContent) {
         let text = await response.text();
-        let foundTenant = targetHost; // Fallback về targetHost hiện tại
+        let foundTenant = null;
 
-        // A. Thay thế URL tuyệt đối trong HTML/JS
-        const regexSub = new RegExp(`https?://([a-zA-Z0-9-]+)\\.${baseDomain.replace(/\./g, '\\.')}`, 'g');
-        text = text.replace(regexSub, (match, subdomain) => {
-          foundTenant = subdomain + '.' + baseDomain;
-          return proxyDomain;
+        // Rewrite absolute URLs (cả http/https và escaped)
+        const patterns = [
+          // https://sub.k12online.vn hoặc https:\/\/sub.k12online.vn
+          new RegExp(`https?:\\\\?/\\\\?/([a-zA-Z0-9-]+)\\.${baseDomain.replace(/\./g, '\\.')}`, 'gi'),
+          // Protocol-relative
+          new RegExp(`\\\\?/\\\\?/([a-zA-Z0-9-]+)\\.${baseDomain.replace(/\./g, '\\.')}`, 'gi')
+        ];
+
+        patterns.forEach(regex => {
+          text = text.replace(regex, (match, subdomain) => {
+            if (subdomain && subdomain !== 'www') {
+              foundTenant = subdomain + '.' + baseDomain;
+            }
+            // Giữ nguyên format escaping nếu có
+            if (match.includes('\\/')) {
+              return proxyDomain.replace(/\//g, '\\/');
+            }
+            return proxyDomain;
+          });
         });
 
-        const regexRoot = new RegExp(`https?://${baseDomain.replace(/\./g, '\\.')}`, 'g');
-        text = text.replace(regexRoot, proxyDomain);
+        // Rewrite root domain
+        text = text.replace(
+          new RegExp(`https?:\\\\?/\\\\?/${baseDomain.replace(/\./g, '\\.')}`, 'gi'),
+          match => match.includes('\\/') ? proxyDomain.replace(/\//g, '\\/') : proxyDomain
+        );
 
-        // B. Cập nhật cookie nếu phát hiện tenant mới trong body
+        // Set tenant cookie nếu phát hiện subdomain mới
         if (foundTenant && foundTenant !== targetHost) {
-          cookiesToSet.push(`tenant_host=${foundTenant}; Path=/; HttpOnly; Max-Age=86400`);
+          cookiesToSet.push(`tenant_host=${foundTenant}; Path=/; HttpOnly; Max-Age=3600; SameSite=Lax`);
         }
 
-        // C. Chèn Script "Anti Anti Anti" vào đầu <head> hoặc <body>
-        // Script này đánh lừa web gốc rằng nó đang chạy trên domain thật, 
-        // nhưng chặn mọi nỗ lực redirect window.location ra ngoài.
-        const spoofScript = `<script>
-        (function() {
-          try {
-            const realHost = '${targetHost}';
-            const proxyHost = window.location.hostname;
-            
-            // 1. Vô hiệu hóa Service Worker (chặn hijack điều hướng)
-            if (navigator.serviceWorker) {
-              navigator.serviceWorker.register = function() { return Promise.resolve(); };
-            }
-
-            // 2. Spoof window.location để vượt qua check "hostname !== k12online.vn"
-            const locationProxy = new Proxy(window.location, {
-              get: function(target, prop) {
-                if (prop === 'hostname' || prop === 'host') return realHost;
-                if (prop === 'origin') return 'https://' + realHost;
-                if (prop === 'href') return 'https://' + realHost + window.location.pathname + window.location.search;
-                return Reflect.get(...arguments);
-              },
-              set: function(target, prop, value) {
-                if (prop === 'href' || prop === 'location') {
-                  if (typeof value === 'string') {
-                    // Chặn redirect về domain gốc, ép nó quay về proxy
-                    if (value.includes('${baseDomain}')) {
-                      value = value.replace('https://' + realHost, '${proxyDomain}');
-                      value = value.replace('http://' + realHost, '${proxyDomain}');
-                      value = value.replace(realHost, proxyHost);
-                    }
-                  }
+        // ===== ANTI³: HTML OBFUSCATION =====
+        if (contentType.includes('text/html')) {
+          // Inject script chống detection vào <head>
+          const antiDetectScript = `
+            <script>
+              // Anti-Anti-Anti Return Detector
+              (function() {
+                // 1. Spoof navigator properties
+                Object.defineProperty(navigator, 'webdriver', { get: () => false });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['vi-VN', 'vi', 'en-US', 'en'] });
+                
+                // 2. Block fingerprinting common checks
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                  parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+                );
+                
+                // 3. Clean up URL sau khi load (bỏ _rd param)
+                if (window.location.search.includes('_rd=')) {
+                  const cleanUrl = window.location.origin + window.location.pathname;
+                  window.history.replaceState({}, document.title, cleanUrl);
                 }
-                return Reflect.set(...arguments);
-              }
+              })();
+            </script>
+          `;
+          
+          text = text.replace(/<head[^>]*>/i, match => match + antiDetectScript);
+          
+          // Rewrite relative paths thiếu tenant prefix
+          if (url.pathname.match(/^\/[a-zA-Z0-9-]+\//)) {
+            const tenantPrefix = url.pathname.match(/^\/[a-zA-Z0-9-]+/)[0];
+            const relativePathRegex = /(href|action|src)=(["'])(\/(?!\/)(?:page|LMS|module|api|assets|uploads)[^"']*)/gi;
+            text = text.replace(relativePathRegex, (match, attr, quote, path) => {
+              if (path.startsWith(tenantPrefix) || path.includes('://')) return match;
+              return `${attr}=${quote}${tenantPrefix}${path}`;
             });
-            
-            // 3. Override assign và replace
-            window.location.assign = function(url) { window.location.href = url; };
-            window.location.replace = function(url) { window.location.href = url; };
-            
-          } catch(e) { console.warn('Spoof script error', e); }
-        })();
-        <\/script>`;
-
-        if (text.includes('<head>')) {
-          text = text.replace('<head>', '<head>' + spoofScript);
-        } else if (text.includes('<body>')) {
-          text = text.replace('<body>', '<body>' + spoofScript);
-        } else {
-          text = spoofScript + text;
+          }
         }
 
-        // D. Xóa Meta Refresh (chặn auto-redirect bằng HTML)
-        text = text.replace(/<meta\s+http-equiv=["']refresh["'][^>]*>/gi, '');
-        text = text.replace(/<meta\s+[^>]*http-equiv=["']refresh["'][^>]*>/gi, '');
-
-        // E. Xử lý relative path cho HTML (giữ nguyên logic cũ của bạn nhưng an toàn hơn)
-        if (contentType.includes('text/html') && tenantPrefix) {
-          const relativePathRegex = /(href|action|src)=(["'])(\/(?:page|LMS|module|api|assets|login|auth)[^"']*)/gi;
-          text = text.replace(relativePathRegex, (match, attr, quote, path) => {
-            if (path.startsWith(tenantPrefix)) return match;
-            return `${attr}=${quote}${tenantPrefix}${path}`;
-          });
+        if (cookiesToSet.length > 0) {
+          responseHeaders.set('Set-Cookie', cookiesToSet.join(', '));
         }
 
-        // Set cookie trước khi trả về
-        cookiesToSet.forEach(c => responseHeaders.append('Set-Cookie', c));
-        
         return new Response(text, { status: response.status, headers: responseHeaders });
       }
 
-      // 4. TRẢ FILE NHỊ PHÂN (Streaming)
-      cookiesToSet.forEach(c => responseHeaders.append('Set-Cookie', c));
+      // Binary streaming
+      if (cookiesToSet.length > 0) {
+        responseHeaders.set('Set-Cookie', cookiesToSet.join(', '));
+      }
       return new Response(response.body, { status: response.status, headers: responseHeaders });
 
     } catch (err) {
-      return new Response(JSON.stringify({ error: 'Proxy error', details: err.message }), {
-        status: 500,
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      // ANTI³: Stealth error (không lộ là proxy error)
+      return new Response(JSON.stringify({ 
+        error: 'Bad Gateway',
+        code: 502,
+        timestamp: Date.now() 
+      }), {
+        status: 502,
+        headers: { 'Content-Type': 'application/json' }
       });
     }
   }
