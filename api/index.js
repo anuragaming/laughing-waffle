@@ -8,7 +8,7 @@ export default async function handler(req, res) {
   const proxyHost = req.headers['x-forwarded-host'] || req.headers.host;
   const proxyDomain = 'https://' + proxyHost;
 
-  // 1. Kiểm tra Cookie
+  // 1. Kiểm tra Cookie xem đang ở phân hệ (tỉnh/trường) nào
   let targetHost = baseDomain;
   const cookieHeader = req.headers.cookie || '';
   const match = cookieHeader.match(/tenant_host=([^;]+)/);
@@ -35,7 +35,7 @@ export default async function handler(req, res) {
       redirect: 'manual' 
     }); 
 
-    // 2. Chuyển tiếp Header và vô hiệu hóa rào cản bảo mật
+    // 2. Chuyển tiếp Header và tháo gỡ khiên bảo mật gốc
     const headersToDrop = [
       'content-encoding', 'content-length', 'transfer-encoding', 'connection',
       'content-security-policy', 'content-security-policy-report-only', 
@@ -53,7 +53,7 @@ export default async function handler(req, res) {
       cookiesToSet = response.headers.getSetCookie().map(c => c.replace(/Domain=[^;]+;?\s*/ig, '')); 
     } 
 
-    // 3. XỬ LÝ CHUYỂN HƯỚNG HTTP (Login)
+    // 3. XỬ LÝ CHUYỂN HƯỚNG HTTP (Vượt lỗi khi Đăng Nhập)
     if (response.status >= 300 && response.status < 400) { 
       const location = response.headers.get('location'); 
       if (location) { 
@@ -72,7 +72,7 @@ export default async function handler(req, res) {
       } 
     } 
 
-    // 4. KIỂM SOÁT HTML, JSON, JS
+    // 4. THAY MÁU TOÀN BỘ LINK TRONG HTML, JSON, JAVASCRIPT
     const contentType = response.headers.get('content-type') || ''; 
     const isTextContent = contentType.includes('text/') || 
                           contentType.includes('application/json') || 
@@ -83,17 +83,17 @@ export default async function handler(req, res) {
       let text = await response.text(); 
       let foundTenant = null; 
 
+      // Ép các domain con (VD: quangngai.k12online.vn) chạy qua Proxy
       const regexSub = new RegExp(`https:\\\\?/\\\\?/([a-zA-Z0-9-]+)\\.${baseDomain.replace(/\./g, '\\.')}`, 'g'); 
       text = text.replace(regexSub, (match, subdomain) => { 
         foundTenant = subdomain + '.' + baseDomain; 
-        const isEscaped = match.includes('\\/'); 
-        return isEscaped ? proxyDomain.replace(/\//g, '\\/') : proxyDomain; 
+        return match.includes('\\/') ? proxyDomain.replace(/\//g, '\\/') : proxyDomain; 
       }); 
 
+      // Ép root domain (k12online.vn) chạy qua Proxy
       const regexRoot = new RegExp(`https:\\\\?/\\\\?/${baseDomain.replace(/\./g, '\\.')}`, 'g'); 
       text = text.replace(regexRoot, match => { 
-        const isEscaped = match.includes('\\/'); 
-        return isEscaped ? proxyDomain.replace(/\//g, '\\/') : proxyDomain; 
+        return match.includes('\\/') ? proxyDomain.replace(/\//g, '\\/') : proxyDomain; 
       }); 
 
       if (foundTenant && foundTenant !== targetHost) { 
@@ -101,102 +101,49 @@ export default async function handler(req, res) {
       } 
       if (cookiesToSet.length > 0) res.setHeader('Set-Cookie', cookiesToSet); 
 
-      // 5. BƠM MÃ ĐÃ ĐƯỢC FIX LỖI NÚT BẤM
+      // 5. BƠM MÃ ĐÃ ĐƯỢC THIẾT KẾ LẠI (Tương thích 100% với SPA, không liệt nút)
       if (contentType.includes('text/html')) {
+        // Cắt bỏ script quảng cáo nhúng sẵn
         text = text.replace(/<script[^>]*src=["'][^"']*(adsbygoogle|popunder|adzone|doubleclick|adsystem)[^"']*["'][^>]*>[\s\S]*?<\/script>/gi, '');
 
         const injectedScript = `
           <script>
-            // --- 1. CHỐNG PHÁT HIỆN CHUYỂN TAB ---
+            // --- 1. CHỐNG PHÁT HIỆN CHUYỂN TAB (Cách mới: An toàn & Không gây liệt web) ---
             Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
             Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
-            const originalAdd = document.addEventListener;
-            document.addEventListener = function(type, listener, options) {
-              if (type === 'visibilitychange') return;
-              return originalAdd.call(this, type, listener, options);
+            
+            // Bắt sự kiện rời tab từ trứng nước và chặn lại, không can thiệp vào hàm cốt lõi của web
+            const blockVisibility = (e) => {
+                e.stopImmediatePropagation();
+                e.stopPropagation();
             };
+            window.addEventListener('visibilitychange', blockVisibility, true);
+            document.addEventListener('visibilitychange', blockVisibility, true);
 
-            // --- 2. CHẶN POPUP QUẢNG CÁO THÔNG MINH (Bảo tồn nút mở tài liệu/bài thi) ---
+            // --- 2. CHẶN POPUP QUẢNG CÁO RÁC (Cho phép popup tài liệu/đề thi) ---
             const originalWindowOpen = window.open;
             window.open = function(url, name, specs) {
-                if (typeof url === 'string' && ['ads', 'popunder', 'adsystem', 'track'].some(kw => url.toLowerCase().includes(kw))) {
-                    console.log('🛡️ Đã chặn quảng cáo popup!');
+                if (typeof url === 'string' && /(ads|popunder|adsystem|track|doubleclick)/i.test(url)) {
+                    console.log('🛡️ Đã chặn popup quảng cáo!');
                     return null;
                 }
                 return originalWindowOpen.apply(this, arguments);
             };
 
-            // --- 3. XÓA SCRIPT QUẢNG CÁO ẨN ---
+            // --- 3. TIÊU DIỆT SCRIPT QUẢNG CÁO CHÈN ĐỘNG ---
             const observer = new MutationObserver(mutations => {
               mutations.forEach(mutation => {
                 mutation.addedNodes.forEach(node => {
                   if (node.tagName === 'SCRIPT' && node.src) {
-                    if (['ads', 'popunder', 'banner', 'adsystem', 'track'].some(kw => node.src.toLowerCase().includes(kw))) {
-                      node.type = 'javascript/blocked'; node.remove();
+                    if (/(adsbygoogle|popunder|adzone|adsystem)/i.test(node.src)) {
+                      node.type = 'javascript/blocked'; 
+                      node.remove();
                     }
                   }
                 });
               });
             });
             observer.observe(document.documentElement, { childList: true, subtree: true });
-
-            // --- 4. BẢO VỆ SPA: CHO PHÉP BẤM NÚT MƯỢT MÀ ---
-            const proxyDom = "${proxyDomain}";
-            
-            // A. Đánh chặn History API (Cách React/Vue chuyển trang nội bộ)
-            const originalPushState = history.pushState;
-            history.pushState = function(state, unused, url) {
-                let newArgs = Array.prototype.slice.call(arguments);
-                if (typeof url === 'string' && url.includes('k12online.vn')) {
-                    try {
-                        const u = new URL(url, window.location.origin);
-                        document.cookie = "tenant_host=" + u.hostname + "; path=/; max-age=86400";
-                        newArgs[2] = proxyDom + u.pathname + u.search;
-                    } catch(e) {}
-                }
-                return originalPushState.apply(this, newArgs);
-            };
-
-            const originalReplaceState = history.replaceState;
-            history.replaceState = function(state, unused, url) {
-                let newArgs = Array.prototype.slice.call(arguments);
-                if (typeof url === 'string' && url.includes('k12online.vn')) {
-                    try {
-                        const u = new URL(url, window.location.origin);
-                        document.cookie = "tenant_host=" + u.hostname + "; path=/; max-age=86400";
-                        newArgs[2] = proxyDom + u.pathname + u.search;
-                    } catch(e) {}
-                }
-                return originalReplaceState.apply(this, newArgs);
-            };
-
-            // B. Đánh chặn ngầm Fetch API (Fix lỗi Object Request)
-            const originalFetch = window.fetch;
-            window.fetch = async function(...args) {
-                let newArgs = Array.prototype.slice.call(args);
-                if (newArgs[0] && typeof newArgs[0] === 'string' && newArgs[0].includes('k12online.vn')) {
-                    try {
-                        const u = new URL(newArgs[0], window.location.origin);
-                        document.cookie = "tenant_host=" + u.hostname + "; path=/; max-age=86400";
-                        newArgs[0] = proxyDom + u.pathname + u.search;
-                    } catch(e){}
-                }
-                return originalFetch.apply(this, newArgs);
-            };
-
-            // C. Đánh chặn ngầm XHR (Ajax)
-            const originalXhrOpen = XMLHttpRequest.prototype.open;
-            XMLHttpRequest.prototype.open = function(method, url) {
-                let newArgs = Array.prototype.slice.call(arguments);
-                if (typeof url === 'string' && url.includes('k12online.vn')) {
-                    try {
-                        const u = new URL(url, window.location.origin);
-                        document.cookie = "tenant_host=" + u.hostname + "; path=/; max-age=86400";
-                        newArgs[1] = proxyDom + u.pathname + u.search;
-                    } catch(e){}
-                }
-                return originalXhrOpen.apply(this, newArgs);
-            };
           </script>
         `;
         text = text.replace(/<head[^>]*>/i, match => match + injectedScript);
@@ -204,6 +151,7 @@ export default async function handler(req, res) {
 
       res.status(response.status).send(text); 
     } else { 
+      // Xử lý Ảnh, Video, Font chữ
       if (cookiesToSet.length > 0) res.setHeader('Set-Cookie', cookiesToSet); 
       const buffer = await response.arrayBuffer(); 
       res.status(response.status).send(Buffer.from(buffer)); 
