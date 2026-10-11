@@ -7,7 +7,7 @@ export default async function handler(req, res) {
   const proxyHost = req.headers['x-forwarded-host'] || req.headers.host;
   const proxyDomain = 'https://' + proxyHost;
 
-  // 1. Kiểm tra Cookie xem đang ở phân hệ (tỉnh/trường) nào
+  // 1. Kiểm tra Cookie
   let targetHost = baseDomain;
   const cookieHeader = req.headers.cookie || '';
   const match = cookieHeader.match(/tenant_host=([^;]+)/);
@@ -16,7 +16,6 @@ export default async function handler(req, res) {
   const targetDomain = 'https://' + targetHost;
   const targetUrl = targetDomain + req.url;
 
-  // --- CẢI TIẾN: Lấy tiền tố mã trường (ví dụ: /51000705) từ URL gốc để dùng cho việc khôi phục ---
   const prefixMatch = req.url.match(/^\/([a-zA-Z0-9-]+)(?=\/)/);
   const tenantPrefix = prefixMatch ? prefixMatch[0] : ''; 
 
@@ -27,7 +26,6 @@ export default async function handler(req, res) {
 
     const headers = { ...req.headers }; 
     
-    // Xóa sạch mọi dấu vết Proxy để máy chủ K12 không phát hiện ra tên miền giả
     delete headers.host; 
     delete headers.referer; 
     delete headers['accept-encoding']; 
@@ -49,7 +47,6 @@ export default async function handler(req, res) {
       redirect: 'manual' 
     }); 
 
-    // 2. Chuyển tiếp Header và tháo gỡ khiên bảo mật gốc
     const headersToDrop = [
       'content-encoding', 'content-length', 'transfer-encoding', 'connection',
       'content-security-policy', 'content-security-policy-report-only', 
@@ -67,7 +64,7 @@ export default async function handler(req, res) {
       cookiesToSet = response.headers.getSetCookie().map(c => c.replace(/Domain=[^;]+;?\s*/ig, '')); 
     } 
 
-    // 3. XỬ LÝ CHUYỂN HƯỚNG HTTP VÀ CẮT VÒNG LẶP (ĐÃ NÂNG CẤP)
+    // 2. XỬ LÝ CHUYỂN HƯỚNG
     if (response.status >= 300 && response.status < 400) { 
       const location = response.headers.get('location'); 
       if (location) { 
@@ -77,22 +74,17 @@ export default async function handler(req, res) {
         if (locUrl && locUrl.hostname.includes(baseDomain)) { 
           let newPath = locUrl.pathname + locUrl.search;
           
-          // 🛠️ FIX 1: KHÔI PHỤC TIỀN TỐ MÃ TRƯỜNG NẾU BỊ MẤT
-          // Nếu URL mới không có tiền tố, nhưng URL cũ có, và đây là path nội bộ (page, LMS, module...)
           if (tenantPrefix && !newPath.startsWith(tenantPrefix)) {
             if (/^\/(page|LMS|module|api|assets)\//i.test(locUrl.pathname)) {
               newPath = tenantPrefix + newPath;
-              console.log(`🔧 Đã khôi phục tiền tố tenant bị mất: ${newPath}`);
             }
           }
 
-          // 🛠️ FIX 2: PHANH KHẨN CẤP VÒNG LẶP (So sánh pathname thay vì full URL)
           const reqPathname = new URL(req.url, proxyDomain).pathname;
           const locPathname = new URL(newPath, proxyDomain).pathname;
           
           if (locUrl.hostname === targetHost && reqPathname === locPathname) {
-               console.log("🛡️ Đã chặn vòng lặp Redirect tại:", reqPathname);
-               res.status(200).send('<html><body><h1>Đã xử lý chống kẹt Redirect. Vui lòng tải lại trang (F5) hoặc thử thao tác khác.</h1></body></html>');
+               res.status(200).send('<html><body><h1>Đã chặn vòng lặp Redirect. Vui lòng tải lại trang (F5).</h1></body></html>');
                return res.end();
           }
 
@@ -107,7 +99,7 @@ export default async function handler(req, res) {
       } 
     } 
 
-    // 4. THAY MÁU TOÀN BỘ LINK TRONG HTML, JSON, JAVASCRIPT
+    // 3. XỬ LÝ TEXT (HTML, JSON, JS, CSS)
     const contentType = response.headers.get('content-type') || ''; 
     const isTextContent = contentType.includes('text/') || 
                           contentType.includes('application/json') || 
@@ -134,47 +126,36 @@ export default async function handler(req, res) {
       } 
       if (cookiesToSet.length > 0) res.setHeader('Set-Cookie', cookiesToSet); 
 
-      // 5. BƠM MÃ JS BẢO VỆ & SỬA LINK TƯƠNG ĐỐI
       if (contentType.includes('text/html')) {
-        
-        // 🛠️ FIX 3: SỬA CÁC LINK TƯƠNG ĐỐI TRONG HTML ĐỂ KHÔNG BỊ MẤT MÃ TRƯỜNG
-        // Biến các href="/page/..." thành href="/51000705/page/..."
         if (tenantPrefix) {
           const relativePathRegex = /(href|action|src)=(["'])(\/(?:page|LMS|module|api|assets)[^"']*)/gi;
           text = text.replace(relativePathRegex, (match, attr, quote, path) => {
-            if (path.startsWith(tenantPrefix)) return match; // Đã có sẵn thì không làm gì
+            if (path.startsWith(tenantPrefix)) return match;
             return `${attr}=${quote}${tenantPrefix}${path}`;
           });
         }
 
-        // Xóa script quảng cáo
         text = text.replace(/<script[^>]*src=["'][^"']*(adsbygoogle|popunder|adzone|doubleclick|adsystem)[^"']*["'][^>]*>[\s\S]*?<\/script>/gi, '');
 
         const injectedScript = `
           <script>
-            // Chống phát hiện chuyển tab an toàn tuyệt đối
             Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
             Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
             const blockVisibility = (e) => { e.stopImmediatePropagation(); e.stopPropagation(); };
             window.addEventListener('visibilitychange', blockVisibility, true);
             document.addEventListener('visibilitychange', blockVisibility, true);
 
-            // Chặn popup quảng cáo, nhưng cho phép mở tài liệu
             const originalWindowOpen = window.open;
             window.open = function(url, name, specs) {
-                if (typeof url === 'string' && /(ads|popunder|adsystem|track|doubleclick)/i.test(url)) {
-                    return null;
-                }
+                if (typeof url === 'string' && /(ads|popunder|adsystem|track|doubleclick)/i.test(url)) return null;
                 return originalWindowOpen.apply(this, arguments);
             };
 
-            // Tiêu diệt script quảng cáo chạy ẩn
             const observer = new MutationObserver(mutations => {
               mutations.forEach(mutation => {
                 mutation.addedNodes.forEach(node => {
                   if (node.tagName === 'SCRIPT' && node.src && /(adsbygoogle|popunder|adzone|adsystem)/i.test(node.src)) {
-                      node.type = 'javascript/blocked'; 
-                      node.remove();
+                      node.type = 'javascript/blocked'; node.remove();
                   }
                 });
               });
@@ -187,9 +168,19 @@ export default async function handler(req, res) {
 
       res.status(response.status).send(text); 
     } else { 
+      // 4. XỬ LÝ FILE NHỊ PHÂN (ẢNH, VIDEO, TÀI LIỆU...) BẰNG STREAMING CỰC NHANH
       if (cookiesToSet.length > 0) res.setHeader('Set-Cookie', cookiesToSet); 
-      const buffer = await response.arrayBuffer(); 
-      res.status(response.status).send(Buffer.from(buffer)); 
+      res.status(response.status);
+
+      if (response.body) {
+        // Truyền trực tiếp dữ liệu thành từng mảnh nhỏ ngay khi nhận được
+        for await (const chunk of response.body) {
+          res.write(chunk);
+        }
+        return res.end();
+      } else {
+        return res.end();
+      }
     } 
 
   } catch (error) { 
