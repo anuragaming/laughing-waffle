@@ -1,239 +1,166 @@
+const BASE_DOMAIN = 'k12online.vn';
+const BASE_RE = BASE_DOMAIN.replace(/\./g, '\\.');
+const TENANT_COOKIE = 'tenant_host';
+
+// Chỉ cho phép proxy tới k12online.vn và subdomain của nó (chống bị lợi dụng làm open proxy)
+const isAllowedHost = (h) => h === BASE_DOMAIN || h.endsWith('.' + BASE_DOMAIN);
+
+const tenantCookie = (host) =>
+  `${TENANT_COOKIE}=${host}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=86400`;
+
+// Chỉ inject vào HTML. KHÔNG inject vào JS/JSON/CSS (lỗi cũ gây vỡ toàn bộ JS)
+const SPOOF_SCRIPT = `<script>(function(){try{
+  if (navigator.serviceWorker) {
+    navigator.serviceWorker.register = function(){ return Promise.resolve(); };
+  }
+}catch(e){}})();</script>`;
+
 export default {
-  async fetch(request, env, ctx) {
-    const baseDomain = 'k12online.vn';
+  async fetch(request) {
     const url = new URL(request.url);
-    const proxyDomain = url.origin;
-    
-    // 1. Xác định tenant từ cookie hoặc URL
-    let targetHost = baseDomain;
+    const proxyOrigin = url.origin;
+
+    // Preflight CORS
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
+          'Access-Control-Allow-Headers': request.headers.get('access-control-request-headers') || '*',
+          'Access-Control-Max-Age': '86400'
+        }
+      });
+    }
+
+    // 1. Xác định tenant từ cookie (chỉ tin host hợp lệ)
     const cookieHeader = request.headers.get('cookie') || '';
-    const match = cookieHeader.match(/tenant_host=([^;]+)/);
-    if (match) targetHost = match[1];
+    const m = cookieHeader.match(/(?:^|;\s*)tenant_host=([^;]+)/);
+    let targetHost = BASE_DOMAIN;
+    if (m && isAllowedHost(m[1].trim())) targetHost = m[1].trim();
 
     const targetDomain = 'https://' + targetHost;
-    
-    // Tách tenantPrefix từ URL (ví dụ: /tenant1/api/... -> tenantPrefix = /tenant1)
-    const prefixMatch = url.pathname.match(/^\/([a-zA-Z0-9-]+)(?=\/)/);
-    const tenantPrefix = prefixMatch ? '/' + prefixMatch[1] : '';
-    
-    // Đường dẫn thực tế gửi đi server gốc (bỏ tenantPrefix)
-    let targetPath = url.pathname;
-    if (tenantPrefix && targetPath.startsWith(tenantPrefix)) {
-      targetPath = targetPath.substring(tenantPrefix.length);
-    }
-    // Đảm bảo path luôn bắt đầu bằng /
-    if (!targetPath.startsWith('/')) targetPath = '/' + targetPath;
-    
-    const targetUrl = targetDomain + targetPath + url.search;
+    // Giữ nguyên path, KHÔNG cắt prefix nữa (regex cũ cắt nhầm /api, /static, /assets...)
+    const targetUrl = targetDomain + url.pathname + url.search;
 
     try {
-      // 2. Chuẩn bị Request gửi đi (Giấu vết proxy)
+      // 2. Chuẩn bị request gửi đi
       const newHeaders = new Headers(request.headers);
-      const headersToRemove = [
+      [
         'host', 'referer', 'accept-encoding', 'x-forwarded-host',
         'x-forwarded-proto', 'x-forwarded-for', 'x-real-ip',
         'cf-connecting-ip', 'cf-ray', 'cf-visitor', 'sec-fetch-site'
-      ];
-      headersToRemove.forEach(h => newHeaders.delete(h));
-      
+      ].forEach((h) => newHeaders.delete(h));
+
+      // Không gửi cookie nội bộ của proxy lên server gốc
+      const cleanedCookie = cookieHeader
+        .split(';')
+        .map((s) => s.trim())
+        .filter((c) => c && !c.startsWith(TENANT_COOKIE + '='))
+        .join('; ');
+      if (cleanedCookie) newHeaders.set('cookie', cleanedCookie);
+      else newHeaders.delete('cookie');
+
       newHeaders.set('origin', targetDomain);
       newHeaders.set('referer', targetDomain + '/');
 
-      const fetchInit = {
-        method: request.method,
-        headers: newHeaders,
-        redirect: 'manual'
-      };
-
+      const fetchInit = { method: request.method, headers: newHeaders, redirect: 'manual' };
       if (request.method !== 'GET' && request.method !== 'HEAD') {
-        fetchInit.body = await request.clone().arrayBuffer();
+        fetchInit.body = await request.arrayBuffer();
       }
 
       const response = await fetch(targetUrl, fetchInit);
       const responseHeaders = new Headers(response.headers);
-      
-      // Xóa các header gây rối
-      const headersToDrop = [
+
+      [
         'content-encoding', 'content-length', 'transfer-encoding', 'connection',
         'content-security-policy', 'content-security-policy-report-only',
-        'x-frame-options', 'strict-transport-security', 'report-to'
-      ];
-      headersToDrop.forEach(h => responseHeaders.delete(h));
+        'x-frame-options', 'strict-transport-security', 'report-to', 'set-cookie'
+      ].forEach((h) => responseHeaders.delete(h));
 
       responseHeaders.set('Access-Control-Allow-Origin', '*');
-      responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+      responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
 
-      // 3. XỬ LÝ COOKIE CHUẨN (Dùng getSetCookie để không bị lỗi nhiều cookie)
-      const rawCookies = response.headers.getSetCookie ? response.headers.getSetCookie() : [];
+      // 3. Cookie: bỏ Domain gốc để trình duyệt nhận trên domain proxy
       const cookiesToSet = [];
-
-      if (rawCookies.length > 0) {
-        for (const cookie of rawCookies) {
-          // Xóa Domain gốc để trình duyệt chấp nhận cookie trên proxy domain
-          let cleanCookie = cookie
-            .replace(/Domain=[^;]+;?\s*/ig, '')
-            .replace(/domain=[^;]+;?\s*/ig, '');
-          
-          // Đảm bảo có Path=/
-          if (!cleanCookie.toLowerCase().includes('path=')) {
-            cleanCookie += '; Path=/';
-          }
-          cookiesToSet.push(cleanCookie.trim());
-        }
+      const rawCookies = response.headers.getSetCookie ? response.headers.getSetCookie() : [];
+      for (const cookie of rawCookies) {
+        let c = cookie.replace(/;\s*Domain=[^;]*/ig, '');
+        if (!/;\s*path=/i.test(c)) c += '; Path=/';
+        cookiesToSet.push(c.trim());
       }
+      const flushCookies = () => cookiesToSet.forEach((c) => responseHeaders.append('Set-Cookie', c));
 
-      // 4. XỬ LÝ REDIRECT (Chống loop)
+      // 4. Redirect
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get('location');
         if (location) {
-          let locUrl;
-          try { locUrl = new URL(location, targetDomain); } catch (e) { locUrl = null; }
+          let locUrl = null;
+          try { locUrl = new URL(location, targetDomain); } catch (e) { /* ignore */ }
 
-          if (locUrl && locUrl.hostname.includes(baseDomain)) {
-            let newPath = locUrl.pathname + locUrl.search;
-            
-            // Gắn lại tenantPrefix nếu server gốc trả về path không có prefix
-            if (tenantPrefix && !newPath.startsWith(tenantPrefix)) {
-              newPath = tenantPrefix + newPath;
+          if (locUrl && isAllowedHost(locUrl.hostname)) {
+            const newPath = locUrl.pathname + locUrl.search + locUrl.hash;
+
+            // Chặn loop: redirect về chính nó
+            if (locUrl.hostname === targetHost && newPath === url.pathname + url.search) {
+              flushCookies();
+              return new Response(null, { status: 204, headers: responseHeaders });
             }
 
-            // Chặn vòng lặp: nếu redirect về chính nó
-            const currentPath = url.pathname + url.search;
-            if (locUrl.hostname === targetHost && newPath === currentPath) {
-               return new Response(null, { status: 204 }); // 204 No Content để dừng loop
-            }
+            // Tenant chỉ đổi khi server gốc chủ động redirect sang host khác
+            if (locUrl.hostname !== targetHost) cookiesToSet.push(tenantCookie(locUrl.hostname));
 
-            if (locUrl.hostname !== targetHost) {
-              cookiesToSet.push(`tenant_host=${locUrl.hostname}; Path=/; HttpOnly; Max-Age=86400`);
-            }
-            
-            // Set cookie an toàn
-            cookiesToSet.forEach(c => responseHeaders.append('Set-Cookie', c));
-            responseHeaders.set('Location', proxyDomain + newPath);
-            
+            flushCookies();
+            responseHeaders.set('Location', proxyOrigin + newPath);
             return new Response(null, { status: response.status, headers: responseHeaders });
           }
         }
       }
 
-      // 5. XỬ LÝ TEXT (HTML, JS, CSS, JSON) - FIX VỠ GIAO DIỆN
-      const contentType = response.headers.get('content-type') || '';
-      const isTextContent = contentType.includes('text/') || 
-                            contentType.includes('application/json') || 
-                            contentType.includes('javascript') ||
-                            contentType.includes('application/xhtml');
+      // 5. Xử lý nội dung text
+      const ct = (response.headers.get('content-type') || '').toLowerCase();
+      const isHtml = ct.includes('text/html') || ct.includes('application/xhtml');
+      const isRewritable =
+        isHtml || ct.includes('text/css') || ct.includes('javascript') || ct.includes('json');
 
-      if (isTextContent) {
+      if (isRewritable) {
         let text = await response.text();
-        let foundTenant = targetHost;
 
-        // A. Thay thế URL tuyệt đối
-        const regexSub = new RegExp(`https?://([a-zA-Z0-9-]+)\\.${baseDomain.replace(/\./g, '\\.')}`, 'g');
-        text = text.replace(regexSub, (match, subdomain) => {
-          foundTenant = subdomain + '.' + baseDomain;
-          return proxyDomain;
-        });
+        // URL tuyệt đối: https://xxx.k12online.vn -> domain proxy
+        text = text.replace(
+          new RegExp(`https?://(?:[a-zA-Z0-9-]+\\.)*${BASE_RE}`, 'g'),
+          () => proxyOrigin
+        );
+        // URL bị escape trong JSON: https:\/\/xxx.k12online.vn
+        const escapedProxy = proxyOrigin.replace(/\//g, '\\/');
+        text = text.replace(
+          new RegExp(`https?:\\\\/\\\\/(?:[a-zA-Z0-9-]+\\.)*${BASE_RE}`, 'g'),
+          () => escapedProxy
+        );
+        // Protocol-relative: //xxx.k12online.vn
+        text = text.replace(
+          new RegExp(`(["'(=])//(?:[a-zA-Z0-9-]+\\.)*${BASE_RE}`, 'g'),
+          (_, p1) => p1 + proxyOrigin
+        );
 
-        const regexRoot = new RegExp(`https?://${baseDomain.replace(/\./g, '\\.')}`, 'g');
-        text = text.replace(regexRoot, proxyDomain);
-
-        if (foundTenant && foundTenant !== targetHost) {
-          cookiesToSet.push(`tenant_host=${foundTenant}; Path=/; HttpOnly; Max-Age=86400`);
+        if (isHtml) {
+          if (/<head[^>]*>/i.test(text)) {
+            text = text.replace(/<head[^>]*>/i, (tag) => tag + SPOOF_SCRIPT);
+          } else if (/<body[^>]*>/i.test(text)) {
+            text = text.replace(/<body[^>]*>/i, (tag) => tag + SPOOF_SCRIPT);
+          } else {
+            text = SPOOF_SCRIPT + text;
+          }
+          // Xóa meta refresh
+          text = text.replace(/<meta\s+[^>]*http-equiv=["']refresh["'][^>]*>/gi, '');
         }
 
-        // B. Thay thế URL tương đối gốc (Root-relative: bắt đầu bằng /)
-        // Bắt cả src, href, action, và cả url() trong CSS
-        if (tenantPrefix) {
-          // HTML attributes
-          text = text.replace(/(href|src|action|data-src|data-href)=(["'])(\/[^"']*)/gi, (match, attr, quote, path) => {
-            if (path.startsWith(tenantPrefix)) return match;
-            // Bỏ qua các link external hoặc protocol-relative
-            if (path.startsWith('//') || path.includes('://')) return match;
-            return `${attr}=${quote}${tenantPrefix}${path}`;
-          });
-
-          // CSS url()
-          text = text.replace(/url\(\s*(['"]?)(\/[^'")]+)\1\s*\)/gi, (match, quote, path) => {
-            if (path.startsWith(tenantPrefix)) return match;
-            return `url(${quote}${tenantPrefix}${path}${quote})`;
-          });
-        }
-
-        // C. Inject Script chống redirect & sửa History API (Quan trọng cho SPA)
-        const spoofScript = `<script>
-        (function() {
-          try {
-            const realHost = '${targetHost}';
-            const proxyHost = window.location.hostname;
-            const prefix = '${tenantPrefix}';
-
-            // 1. Vô hiệu hóa Service Worker
-            if (navigator.serviceWorker) {
-              navigator.serviceWorker.register = function() { return Promise.resolve(); };
-            }
-
-            // 2. Spoof window.location
-            const locationProxy = new Proxy(window.location, {
-              get: function(target, prop) {
-                if (prop === 'hostname' || prop === 'host') return realHost;
-                if (prop === 'origin') return 'https://' + realHost;
-                if (prop === 'href') return 'https://' + realHost + window.location.pathname + window.location.search;
-                return Reflect.get(...arguments);
-              },
-              set: function(target, prop, value) {
-                if (prop === 'href' || prop === 'location') {
-                  if (typeof value === 'string' && value.includes('${baseDomain}')) {
-                    value = value.replace('https://' + realHost, '${proxyDomain}');
-                    value = value.replace('http://' + realHost, '${proxyDomain}');
-                    value = value.replace(realHost, proxyHost);
-                  }
-                }
-                return Reflect.set(...arguments);
-              }
-            });
-            window.location.assign = function(url) { window.location.href = url; };
-            window.location.replace = function(url) { window.location.href = url; };
-
-            // 3. Sửa History API để giữ tenantPrefix khi trang web tự đổi URL
-            const originalPushState = history.pushState;
-            history.pushState = function(state, title, url) {
-              if (url && typeof url === 'string' && url.startsWith('/') && !url.startsWith(prefix)) {
-                url = prefix + url;
-              }
-              return originalPushState.call(history, state, title, url);
-            };
-            
-            const originalReplaceState = history.replaceState;
-            history.replaceState = function(state, title, url) {
-              if (url && typeof url === 'string' && url.startsWith('/') && !url.startsWith(prefix)) {
-                url = prefix + url;
-              }
-              return originalReplaceState.call(history, state, title, url);
-            };
-
-          } catch(e) { console.warn('Proxy script error', e); }
-        })();
-        <\/script>`;
-
-        if (text.includes('<head>')) {
-          text = text.replace('<head>', '<head>' + spoofScript);
-        } else if (text.includes('<body>')) {
-          text = text.replace('<body>', '<body>' + spoofScript);
-        } else {
-          text = spoofScript + text;
-        }
-
-        // Xóa Meta Refresh
-        text = text.replace(/<meta\s+[^>]*http-equiv=["']refresh["'][^>]*>/gi, '');
-
-        // Set cookie
-        cookiesToSet.forEach(c => responseHeaders.append('Set-Cookie', c));
-        
+        flushCookies();
         return new Response(text, { status: response.status, headers: responseHeaders });
       }
 
-      // 6. TRẢ FILE NHỊ PHÂN (Ảnh, Font, PDF...)
-      cookiesToSet.forEach(c => responseHeaders.append('Set-Cookie', c));
+      // 6. Còn lại (ảnh, font, pdf, event-stream...): stream thẳng, không buffer
+      flushCookies();
       return new Response(response.body, { status: response.status, headers: responseHeaders });
 
     } catch (err) {
@@ -243,4 +170,4 @@ export default {
       });
     }
   }
-}
+};
