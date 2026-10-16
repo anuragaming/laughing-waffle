@@ -14,18 +14,18 @@ export default {
     }
 
     const url = new URL(request.url);
-    const proxyDomain = url.origin; // Domain trung gian của bạn
+    const proxyDomain = url.origin; // Domain trung gian của bạn (Ví dụ: https://your-proxy.com)
     
-    // Domain gốc mặc định (chỉ dùng làm fallback nếu không phát hiện được domain xoay)
-    const defaultTargetHost = 'k12online.vn'; 
-    const defaultTargetDomain = 'https://' + defaultTargetHost;
+    // CẤU HÌNH TARGET: Bạn có thể đổi thành bất kỳ domain nào họ xoay sang
+    // Hiện tại đang đặt là subdomain cụ thể mà bạn đã cung cấp
+    const targetHost = 'quangngai.k12online.vn'; 
+    const targetDomain = 'https://' + targetHost;
     
-    // Cố gắng lấy target từ header tùy chỉnh nếu bạn có cơ chế chuyển mạch domain động
-    const targetDomain = request.headers.get('x-proxy-target') || defaultTargetDomain;
+    // Xây dựng URL đích để fetch
     const targetUrl = targetDomain + url.pathname + url.search;
 
     try {
-      // 2. Xử lý Headers gửi đi
+      // 2. Xử lý Headers gửi đi (Giả mạo trình duyệt)
       const newHeaders = new Headers(request.headers);
       const headersToRemove = [
         'host', 'referer', 'accept-encoding', 'x-forwarded-host',
@@ -34,8 +34,6 @@ export default {
       ];
       headersToRemove.forEach(h => newHeaders.delete(h));
       
-      // Lấy host từ targetDomain để giả mạo chính xác
-      const targetHost = new URL(targetDomain).host;
       newHeaders.set('Host', targetHost);
       newHeaders.set('Origin', targetDomain);
       newHeaders.set('Referer', targetDomain + '/');
@@ -43,18 +41,18 @@ export default {
       const fetchInit = {
         method: request.method,
         headers: newHeaders,
-        redirect: 'manual' // QUAN TRỌNG: Giữ quyền kiểm soát mọi redirect
+        redirect: 'manual' // CỰC KỲ QUAN TRỌNG: Không cho phép fetch tự động redirect, để Worker tự xử lý
       };
 
       if (request.method !== 'GET' && request.method !== 'HEAD') {
         fetchInit.body = await request.clone().arrayBuffer();
       }
 
-      // 3. Fetch dữ liệu
+      // 3. Fetch dữ liệu từ target
       const response = await fetch(targetUrl, fetchInit);
       const responseHeaders = new Headers(response.headers);
       
-      // 4. Xóa headers chống nhúng và bảo mật gây lỗi
+      // 4. Xóa các header bảo mật/chống nhúng
       const headersToDrop = [
         'content-encoding', 'content-length', 'transfer-encoding', 'connection',
         'content-security-policy', 'content-security-policy-report-only',
@@ -66,37 +64,39 @@ export default {
       responseHeaders.set('Access-Control-Allow-Origin', '*');
       responseHeaders.set('Access-Control-Allow-Credentials', 'true');
 
-      // 5. Xử lý Cookie (Giữ session, ép về Path=/)
+      // 5. Xử lý Cookie (Giữ session, xóa domain gốc để trình duyệt chấp nhận trên proxy)
       const rawCookies = response.headers.getSetCookie ? response.headers.getSetCookie() : [];
       responseHeaders.delete('set-cookie');
       for (const cookie of rawCookies) {
         let cleanCookie = cookie
           .replace(/Domain=[^;]+;?\s*/ig, '') // Xóa domain gốc
-          .replace(/SameSite=[^;]+;?\s*/ig, '; SameSite=Lax'); // Tránh bị chặn cross-site
+          .replace(/SameSite=[^;]+;?\s*/ig, '; SameSite=Lax'); 
         if (!cleanCookie.toLowerCase().includes('path=')) {
           cleanCookie += '; Path=/';
         }
         responseHeaders.append('Set-Cookie', cleanCookie.trim());
       }
 
-      // 6. XỬ LÝ REDIRECT: Bẻ lái MỌI redirect về lại proxyDomain
+      // ============================================================
+      // 6. BẼ LÁI REDIRECT (CHỐT CHẶN CHÍNH): 
+      // Nếu server gốc trả về 301/302/307/308 với Location là domain thật,
+      // ta sẽ cắt bỏ domain thật đó và thay bằng proxyDomain.
+      // ============================================================
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get('location');
         if (location) {
-          let locUrl;
-          try { 
-            // Parse URL mới, kể cả nó là domain lạ
-            locUrl = new URL(location, targetDomain); 
-          } catch (e) { 
-            locUrl = null; 
-          }
-
-          if (locUrl) {
-            // Ép đường dẫn mới chạy trên proxyDomain của bạn
-            const redirectedPath = locUrl.pathname + locUrl.search;
-            responseHeaders.set('Location', proxyDomain + redirectedPath);
-            return new Response(null, { status: response.status, headers: responseHeaders });
-          }
+          let newLoc = location;
+          
+          // Nếu là absolute URL (http://... hoặc https://...), thay thế toàn bộ phần domain bằng proxyDomain
+          newLoc = newLoc.replace(/^https?:\/\/[^\/]+/i, proxyDomain);
+          
+          // Nếu là protocol-relative URL (//quangngai.k12online.vn/...), thay bằng proxyDomain
+          newLoc = newLoc.replace(/^\/\/[^\/]+/i, proxyDomain);
+          
+          // Nếu là relative URL (/page/home), giữ nguyên, trình duyệt sẽ tự ghép vào proxyDomain
+          
+          responseHeaders.set('Location', newLoc);
+          return new Response(null, { status: response.status, headers: responseHeaders });
         }
       }
 
@@ -108,36 +108,38 @@ export default {
       if (isHtml || isJsOrCss) {
         let text = await response.text();
 
-        // ==========================================
-        // A. UNIVERSAL DOMAIN REPLACER (Thay thế MỌI domain)
-        // ==========================================
-        // Regex này tìm bất kỳ chuỗi nào bắt đầu bằng http://, https:// hoặc // và có chứa dấu chấm (domain)
-        // Sau đó thay thế toàn bộ phần domain đó bằng proxyDomain của bạn
-        const universalDomainRegex = /(https?:)?\/\/[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?=[\/\?\"\'\s\)]|$)/g;
+        // ============================================================
+        // A. THAY THẾ DOMAIN TRONG SOURCE CODE
+        // Thay thế mọi biến thể của k12online.vn (có hoặc không có subdomain)
+        // ============================================================
+        const targetRegex = /https?:\/\/(?:[a-zA-Z0-9-]+\.)?k12online\.vn/gi;
+        const protocolRelativeRegex = /\/\/(?:[a-zA-Z0-9-]+\.)?k12online\.vn/gi;
         
-        // Chỉ thay thế nếu nó KHÔNG PHẢI là proxyDomain hiện tại (tránh thay thế lặp vô tận)
-        text = text.replace(universalDomainRegex, (match) => {
-          if (match.includes(proxyDomain.replace('https://', '').replace('http://', ''))) {
-            return match; 
-          }
-          return proxyDomain;
-        });
+        text = text.replace(targetRegex, proxyDomain);
+        text = text.replace(protocolRelativeRegex, proxyDomain);
 
-        // ==========================================
-        // B. INJECTED CAGE SCRIPT (Lồng kính JavaScript)
-        // ==========================================
+        // ============================================================
+        // B. INJECTED CAGE SCRIPT (LỒNG KÍNH JS)
+        // Chạy NGAY LẬP TỨC để giả mạo window.location trước khi site JS kịp kiểm tra
+        // ============================================================
         const cageScript = `<script>
         (function() {
           const PROXY_ORIGIN = '${proxyDomain}';
-          
-          // 1. Chặn Anti-Return / Visibility Detector
+          const PROXY_HOSTNAME = new URL(PROXY_ORIGIN).hostname;
+
+          // 1. GIẢ MẠO WINDOW.LOCATION (Chặn JS kiểm tra hostname để redirect)
+          Object.defineProperty(window.location, 'hostname', { get: () => PROXY_HOSTNAME, configurable: true });
+          Object.defineProperty(window.location, 'host', { get: () => new URL(PROXY_ORIGIN).host, configurable: true });
+          Object.defineProperty(window.location, 'origin', { get: () => PROXY_ORIGIN, configurable: true });
+          Object.defineProperty(window.location, 'href', { 
+            get: () => PROXY_ORIGIN + window.location.pathname + window.location.search, 
+            configurable: true 
+          });
+
+          // 2. CHẶN ANTI-RETURN / VISIBILITY DETECTOR
           const overrideProp = (obj, prop, value) => {
             try {
-              Object.defineProperty(obj, prop, {
-                get: () => value,
-                set: () => {},
-                configurable: true
-              });
+              Object.defineProperty(obj, prop, { get: () => value, set: () => {}, configurable: true });
             } catch(e) {}
           };
           overrideProp(Document.prototype, 'hidden', false);
@@ -163,31 +165,24 @@ export default {
             return originalAddEventListener.call(this, type, listener, options);
           };
 
-          // 2. VÔ HIỆU HÓA navigator.sendBeacon (Chống gửi log ngầm)
+          // 3. VÔ HIỆU HÓA navigator.sendBeacon
           if (navigator.sendBeacon) {
             navigator.sendBeacon = function(url, data) { return true; };
           }
 
-          // 3. BẼ LÁI MỌI FETCH REQUEST (Chặn JS gọi ra domain lạ)
+          // 4. BẼ LÁI FETCH & XHR (Nếu JS cố gọi API sang domain thật)
           const originalFetch = window.fetch;
           window.fetch = function(input, init) {
             let targetUrl = typeof input === 'string' ? input : input.url;
-            if (targetUrl.startsWith('http') && !targetUrl.startsWith(PROXY_ORIGIN)) {
+            if (typeof targetUrl === 'string' && targetUrl.startsWith('http') && !targetUrl.startsWith(PROXY_ORIGIN)) {
               try {
                 const parsed = new URL(targetUrl);
                 targetUrl = PROXY_ORIGIN + parsed.pathname + parsed.search;
               } catch(e) {}
             }
-            
-            if (typeof input === 'string') {
-              return originalFetch.call(this, targetUrl, init);
-            } else {
-              const newRequest = new Request(targetUrl, input);
-              return originalFetch.call(this, newRequest, init);
-            }
+            return originalFetch.call(this, typeof input === 'string' ? targetUrl : new Request(targetUrl, input), init);
           };
 
-          // 4. BẼ LÁI MỌI XMLHTTPREQUEST (AJAX)
           const originalXHROpen = XMLHttpRequest.prototype.open;
           XMLHttpRequest.prototype.open = function(method, url, async, user, password) {
             if (typeof url === 'string' && url.startsWith('http') && !url.startsWith(PROXY_ORIGIN)) {
@@ -199,15 +194,12 @@ export default {
             return originalXHROpen.call(this, method, url, async, user, password);
           };
 
-          // 5. CHẶN WINDOW.LOCATION REDIRECT (Chặn JS cố tình đổi trang)
+          // 5. CHẶN WINDOW.LOCATION ASSIGN/REPLACE
           const originalAssign = window.location.assign;
           window.location.assign = function(url) {
             try {
               const parsed = new URL(url, window.location.origin);
-              if (parsed.origin !== PROXY_ORIGIN) {
-                parsed = new URL(parsed.pathname + parsed.search, PROXY_ORIGIN);
-              }
-              return originalAssign.call(window.location, parsed.toString());
+              return originalAssign.call(window.location, PROXY_ORIGIN + parsed.pathname + parsed.search);
             } catch(e) { return originalAssign.call(window.location, url); }
           };
           
@@ -215,20 +207,17 @@ export default {
           window.location.replace = function(url) {
             try {
               const parsed = new URL(url, window.location.origin);
-              if (parsed.origin !== PROXY_ORIGIN) {
-                parsed = new URL(parsed.pathname + parsed.search, PROXY_ORIGIN);
-              }
-              return originalReplace.call(window.location, parsed.toString());
+              return originalReplace.call(window.location, PROXY_ORIGIN + parsed.pathname + parsed.search);
             } catch(e) { return originalReplace.call(window.location, url); }
           };
 
-          // Xóa các handler inline
+          // Xóa handler inline
           window.onblur = window.onfocus = window.onpagehide = window.onpageshow = window.onvisibilitychange = null;
           document.onvisibilitychange = null;
         })();
         <\/script>`;
 
-        // Inject vào đầu trang
+        // Inject vào vị trí sớm nhất có thể
         if (text.includes('<head>')) {
           text = text.replace('<head>', `<head><base href="${proxyDomain}/">` + cageScript);
         } else if (text.includes('<body>')) {
