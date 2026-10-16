@@ -1,12 +1,6 @@
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-
-    // ===== CẤU HÌNH =====
-    const TARGET_HOST = 'k12online.vn';
-    const TARGET_ORIGIN = 'https://' + TARGET_HOST;
-    const PROXY_ORIGIN = url.origin;
-
+    // 1. Xử lý CORS Preflight
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         status: 204,
@@ -19,261 +13,195 @@ export default {
       });
     }
 
-    const targetUrl = TARGET_ORIGIN + url.pathname + url.search;
+    const url = new URL(request.url);
+    const proxyDomain = url.origin; // Domain trung gian của bạn (giữ cố định)
+    
+    // 2. Cấu hình domain đích (Target)
+    const targetHost = 'k12online.vn'; 
+    const targetDomain = 'https://' + targetHost;
+    const targetUrl = targetDomain + url.pathname + url.search;
 
     try {
+      // 3. Xử lý Headers gửi đi (Giả mạo yêu cầu đến từ trình duyệt bình thường)
       const newHeaders = new Headers(request.headers);
-      [
-        'host','referer','accept-encoding','x-forwarded-host','x-forwarded-proto',
-        'x-forwarded-for','x-real-ip','cf-connecting-ip','cf-ray','cf-visitor',
-        'sec-fetch-site','sec-fetch-mode','sec-fetch-dest','origin'
-      ].forEach(h => newHeaders.delete(h));
-
-      newHeaders.set('Host', TARGET_HOST);
-      newHeaders.set('Origin', TARGET_ORIGIN);
-      newHeaders.set('Referer', TARGET_ORIGIN + '/');
-      newHeaders.set('User-Agent', request.headers.get('User-Agent') || 'Mozilla/5.0');
+      const headersToRemove = [
+        'host', 'referer', 'accept-encoding', 'x-forwarded-host',
+        'x-forwarded-proto', 'x-forwarded-for', 'x-real-ip',
+        'cf-connecting-ip', 'cf-ray', 'cf-visitor', 'sec-fetch-site'
+      ];
+      headersToRemove.forEach(h => newHeaders.delete(h));
+      
+      newHeaders.set('Host', targetHost);
+      newHeaders.set('Origin', targetDomain);
+      newHeaders.set('Referer', targetDomain + '/');
 
       const fetchInit = {
         method: request.method,
         headers: newHeaders,
-        redirect: 'manual'
+        redirect: 'manual' // Giữ quyền kiểm soát mọi lệnh redirect
       };
-      if (!['GET','HEAD'].includes(request.method)) {
+
+      if (request.method !== 'GET' && request.method !== 'HEAD') {
         fetchInit.body = await request.clone().arrayBuffer();
       }
 
+      // 4. Fetch dữ liệu từ target
       const response = await fetch(targetUrl, fetchInit);
       const responseHeaders = new Headers(response.headers);
-
-      [
-        'content-encoding','content-length','transfer-encoding','connection',
-        'content-security-policy','content-security-policy-report-only',
-        'x-frame-options','strict-transport-security','report-to',
-        'cross-origin-opener-policy','cross-origin-embedder-policy',
-        'cross-origin-resource-policy','permissions-policy'
-      ].forEach(h => responseHeaders.delete(h));
+      
+      // 5. Xóa các header gây chặn nhúng (iframe) hoặc gây lỗi giải nén
+      const headersToDrop = [
+        'content-encoding', 'content-length', 'transfer-encoding', 'connection',
+        'content-security-policy', 'content-security-policy-report-only',
+        'x-frame-options', 'strict-transport-security', 'report-to',
+        'cross-origin-embedder-policy', 'cross-origin-opener-policy', 'cross-origin-resource-policy'
+      ];
+      headersToDrop.forEach(h => responseHeaders.delete(h));
 
       responseHeaders.set('Access-Control-Allow-Origin', '*');
       responseHeaders.set('Access-Control-Allow-Credentials', 'true');
 
-      // ===== COOKIE =====
+      // 6. Xử lý Cookie (Giữ phiên đăng nhập, ép về Path=/ và xóa Domain gốc)
       const rawCookies = response.headers.getSetCookie ? response.headers.getSetCookie() : [];
       responseHeaders.delete('set-cookie');
-      const cookiesToSet = rawCookies.map(cookie => {
-        let c = cookie
+      for (const cookie of rawCookies) {
+        let cleanCookie = cookie
           .replace(/Domain=[^;]+;?\s*/ig, '')
-          .replace(/SameSite=[^;]+;?\s*/ig, '; SameSite=Lax')
-          .replace(/Secure;?\s*/ig, '');
-        if (!/path=/i.test(c)) c += '; Path=/';
-        return c.trim();
-      });
+          .replace(/SameSite=[^;]+;?\s*/ig, '; SameSite=Lax');
+        if (!cleanCookie.toLowerCase().includes('path=')) {
+          cleanCookie += '; Path=/';
+        }
+        responseHeaders.append('Set-Cookie', cleanCookie.trim());
+      }
 
-      // ===== REDIRECT =====
+      // 7. Xử lý Redirect (Bẻ lái mọi redirect về lại proxyDomain)
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get('location');
         if (location) {
-          try {
-            const locUrl = new URL(location, TARGET_ORIGIN);
-            // Nếu redirect nội bộ → giữ ở proxy
-            if (locUrl.hostname === TARGET_HOST) {
-              responseHeaders.set('Location', PROXY_ORIGIN + locUrl.pathname + locUrl.search);
-            } else {
-              // Redirect ra ngoài → cũng kéo về proxy (tuỳ nhu cầu)
-              responseHeaders.set('Location', PROXY_ORIGIN + locUrl.pathname + locUrl.search);
-            }
-          } catch {}
-        }
-        cookiesToSet.forEach(c => responseHeaders.append('Set-Cookie', c));
-        return new Response(null, { status: response.status, headers: responseHeaders });
-      }
+          let locUrl;
+          try { locUrl = new URL(location, targetDomain); } catch (e) { locUrl = null; }
 
-      const contentType = (response.headers.get('content-type') || '').toLowerCase();
-      const isHtml = contentType.includes('text/html') || contentType.includes('application/xhtml');
-      const isJs = contentType.includes('javascript') || contentType.includes('ecmascript');
-      const isCss = contentType.includes('text/css');
-      const isJson = contentType.includes('application/json');
-
-      // ===== REWRITE BODY =====
-      if (isHtml || isJs || isCss || isJson) {
-        let text = await response.text();
-
-        const escapedHost = TARGET_HOST.replace(/\./g, '\\.');
-        const reHttp  = new RegExp(`https?://${escapedHost}`, 'g');
-        const reProto = new RegExp(`//${escapedHost}`, 'g');
-
-        text = text.replace(reHttp, PROXY_ORIGIN);
-        text = text.replace(reProto, '//' + new URL(PROXY_ORIGIN).host);
-
-        if (isHtml) {
-          text = text.replace(
-            /<meta\s+[^>]*http-equiv=["']refresh["'][^>]*>/gi,
-            ''
-          );
-
-          const injectedScript = buildAntiDetectScript(PROXY_ORIGIN, TARGET_HOST);
-
-          // Chèn CÀNG SỚM CÀNG TỐT — trước mọi script khác
-          if (/<head[^>]*>/i.test(text)) {
-            text = text.replace(/<head([^>]*)>/i, `<head$1>${injectedScript}`);
-          } else if (/<html[^>]*>/i.test(text)) {
-            text = text.replace(/<html([^>]*)>/i, `<html$1><head>${injectedScript}</head>`);
-          } else {
-            text = injectedScript + text;
+          if (locUrl) {
+            const redirectedPath = locUrl.pathname + locUrl.search;
+            responseHeaders.set('Location', proxyDomain + redirectedPath);
+            return new Response(null, { status: response.status, headers: responseHeaders });
           }
         }
+      }
 
-        cookiesToSet.forEach(c => responseHeaders.append('Set-Cookie', c));
+      // 8. Xử lý nội dung HTML
+      const contentType = (response.headers.get('content-type') || '').toLowerCase();
+      const isHtml = contentType.includes('text/html') || contentType.includes('application/xhtml');
+
+      if (isHtml) {
+        let text = await response.text();
+
+        // Thay thế link tuyệt đối và protocol-relative (//k12online.vn)
+        const escapedHost = targetHost.replace(/\./g, '\\.');
+        const regexRoot = new RegExp(`https?://${escapedHost}|//${escapedHost}`, 'g');
+        text = text.replace(regexRoot, proxyDomain);
+
+        // ==========================================
+        // SCRIPT CHỐNG ANTI-RETURN & BẢO VỆ PHIÊN
+        // ==========================================
+        const antiDetectScript = `<script>
+        (function() {
+          try {
+            // 1. Vô hiệu hóa thuộc tính visibility trên mọi instance của Document
+            const overrideProp = (obj, prop, value) => {
+              try {
+                Object.defineProperty(obj, prop, {
+                  get: () => value,
+                  set: () => {},
+                  configurable: true
+                });
+              } catch(e) {}
+            };
+            
+            overrideProp(Document.prototype, 'hidden', false);
+            overrideProp(Document.prototype, 'visibilityState', 'visible');
+            overrideProp(Document.prototype, 'webkitHidden', false);
+            overrideProp(Document.prototype, 'webkitVisibilityState', 'visible');
+            overrideProp(document, 'hidden', false);
+            overrideProp(document, 'visibilityState', 'visible');
+
+            // 2. Chặn MỌI event listener liên quan đến việc phát hiện rời trang
+            const originalAddEventListener = EventTarget.prototype.addEventListener;
+            EventTarget.prototype.addEventListener = function(type, listener, options) {
+              const detectEvents = ['visibilitychange', 'webkitvisibilitychange', 'blur', 'focus', 'mouseleave', 'mouseenter', 'pagehide', 'pageshow', 'beforeunload', 'unload'];
+              if (detectEvents.includes(type)) {
+                const wrappedListener = function(e) {
+                  e.preventDefault();
+                  e.stopImmediatePropagation();
+                  e.stopPropagation();
+                  return false;
+                };
+                return originalAddEventListener.call(this, type, wrappedListener, options);
+              }
+              return originalAddEventListener.call(this, type, listener, options);
+            };
+
+            // 3. Vô hiệu hóa navigator.sendBeacon (chống gửi log/analytics ngầm khi thoát)
+            if (navigator.sendBeacon) {
+              navigator.sendBeacon = function(url, data) {
+                return true; // Giả vờ gửi thành công nhưng thực tế không làm gì
+              };
+            }
+
+            // 4. Chặn window.location.assign/replace cố tình redirect sang domain khác
+            const originalAssign = window.location.assign;
+            window.location.assign = function(url) {
+              try {
+                const u = new URL(url, window.location.origin);
+                if (u.hostname !== window.location.hostname) u.hostname = window.location.hostname;
+                return originalAssign.call(window.location, u.toString());
+              } catch(e) { return originalAssign.call(window.location, url); }
+            };
+            
+            const originalReplace = window.location.replace;
+            window.location.replace = function(url) {
+              try {
+                const u = new URL(url, window.location.origin);
+                if (u.hostname !== window.location.hostname) u.hostname = window.location.hostname;
+                return originalReplace.call(window.location, u.toString());
+              } catch(e) { return originalReplace.call(window.location, url); }
+            };
+
+            // 5. Xóa sạch các handler inline có sẵn trên window/document
+            window.onblur = null;
+            window.onfocus = null;
+            window.onpagehide = null;
+            window.onpageshow = null;
+            window.onvisibilitychange = null;
+            document.onvisibilitychange = null;
+            
+          } catch(e) {
+            console.warn('Anti-detect bypass error:', e);
+          }
+        })();
+        <\/script>`;
+
+        // Inject script và base tag vào đầu <head>
+        if (text.includes('<head>')) {
+          text = text.replace('<head>', `<head><base href="${proxyDomain}/">` + antiDetectScript);
+        } else if (text.includes('<body>')) {
+          text = text.replace('<body>', `<body>` + antiDetectScript);
+        }
+
+        // Xóa meta refresh độc hại (tự động chuyển hướng sau X giây)
+        text = text.replace(/<meta\s+[^>]*http-equiv=["']refresh["'][^>]*>/gi, '');
+
         return new Response(text, { status: response.status, headers: responseHeaders });
       }
 
-      // Binary passthrough
-      cookiesToSet.forEach(c => responseHeaders.append('Set-Cookie', c));
+      // 9. Trả về nội dung không phải HTML (JS, CSS, Image, v.v.) nguyên vẹn
       return new Response(response.body, { status: response.status, headers: responseHeaders });
 
     } catch (err) {
-      return new Response(JSON.stringify({ error: 'Proxy Error', details: err.message }), {
+      return new Response(JSON.stringify({ error: 'Proxy Gateway Error', details: err.message }), {
         status: 500,
         headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
       });
     }
   }
-};
-
-// ============================================================
-// SCRIPT CHỐNG ANTI-RETURN DETECTOR (chèn trước mọi script khác)
-// ============================================================
-function buildAntiDetectScript(PROXY_ORIGIN, TARGET_HOST) {
-  return `<script>
-(function(){
-  'use strict';
-  try {
-    // ---- 1. Vô hiệu hoá Page Visibility API ----
-    var hiddenProps = {
-      hidden: false,
-      visibilityState: 'visible',
-      webkitHidden: false,
-      webkitVisibilityState: 'visible',
-      mozHidden: false,
-      mozVisibilityState: 'visible',
-      msHidden: false,
-      msVisibilityState: 'visible'
-    };
-    Object.keys(hiddenProps).forEach(function(k){
-      try {
-        Object.defineProperty(document, k, { get: function(){ return hiddenProps[k]; }, configurable: false });
-        Object.defineProperty(Document.prototype, k, { get: function(){ return hiddenProps[k]; }, configurable: false });
-      } catch(e){}
-    });
-
-    // ---- 2. hasFocus luôn true ----
-    try {
-      Document.prototype.hasFocus = function(){ return true; };
-      document.hasFocus = function(){ return true; };
-    } catch(e){}
-
-    // ---- 3. Chặn event blur/visibility/pagehide ----
-    var blocked = ['visibilitychange','webkitvisibilitychange','mozvisibilitychange',
-                   'msvisibilitychange','blur','pagehide','beforeunload','freeze'];
-    var stopIt = function(e){
-      try {
-        e.stopImmediatePropagation();
-        e.stopPropagation();
-        if (e.preventDefault) e.preventDefault();
-      } catch(_){}
-      return false;
-    };
-    blocked.forEach(function(evt){
-      try {
-        window.addEventListener(evt, stopIt, true);
-        document.addEventListener(evt, stopIt, true);
-        document.body && document.body.addEventListener(evt, stopIt, true);
-      } catch(e){}
-    });
-
-    // ---- 4. Override onblur / onvisibilitychange / onpagehide ----
-    ['onblur','onvisibilitychange','onpagehide','onbeforeunload'].forEach(function(p){
-      try {
-        Object.defineProperty(window, p, { get: function(){ return null; }, set: function(){}, configurable: false });
-        Object.defineProperty(document, p, { get: function(){ return null; }, set: function(){}, configurable: false });
-      } catch(e){}
-    });
-
-    // ---- 5. requestAnimationFrame luôn chạy như đang visible ----
-    var _raf = window.requestAnimationFrame.bind(window);
-    window.requestAnimationFrame = function(cb){
-      return _raf(function(t){ cb(t); });
-    };
-    var _ric = window.requestIdleCallback;
-    if (_ric) window.requestIdleCallback = function(cb, o){ return _ric(function(d){ cb(d); }, o); };
-
-    // ---- 6. Chặn sendBeacon tracking ----
-    if (navigator.sendBeacon) {
-      navigator.sendBeacon = function(){ return true; };
-    }
-
-    // ---- 7. Chặn fetch/image beacon khi unload ----
-    // Ghi đè window.fetch để ép mọi URL về proxy
-    var _fetch = window.fetch;
-    if (_fetch) {
-      window.fetch = function(input, init){
-        try {
-          if (typeof input === 'string' && /^https?:\\/\\//i.test(input)) {
-            var u = new URL(input);
-            if (u.hostname !== location.hostname) {
-              input = '${PROXY_ORIGIN}' + u.pathname + u.search + u.hash;
-            }
-          } else if (input && input.url && /^https?:\\/\\//i.test(input.url)) {
-            var u2 = new URL(input.url);
-            if (u2.hostname !== location.hostname) {
-              input = new Request('${PROXY_ORIGIN}' + u2.pathname + u2.search + u2.hash, input);
-            }
-          }
-        } catch(e){}
-        return _fetch.call(this, input, init);
-      };
-    }
-
-    // ---- 8. XMLHttpRequest open → rewrite ----
-    var _open = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function(method, url){
-      try {
-        if (typeof url === 'string' && /^https?:\\/\\//i.test(url)) {
-          var u = new URL(url);
-          if (u.hostname !== location.hostname) {
-            arguments[1] = '${PROXY_ORIGIN}' + u.pathname + u.search;
-          }
-        }
-      } catch(e){}
-      return _open.apply(this, arguments);
-    };
-
-    // ---- 9. Image.src tracking ----
-    try {
-      var _imgSrc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
-      Object.defineProperty(HTMLImageElement.prototype, 'src', {
-        get: _imgSrc.get,
-        set: function(v){
-          try {
-            if (typeof v === 'string' && /^https?:\\/\\//i.test(v)) {
-              var u = new URL(v);
-              if (u.hostname !== location.hostname) v = '${PROXY_ORIGIN}' + u.pathname + u.search;
-            }
-          } catch(e){}
-          return _imgSrc.set.call(this, v);
-        },
-        configurable: true
-      });
-    } catch(e){}
-
-    // ---- 10. Override document.referrer / window.name ----
-    try {
-      Object.defineProperty(document, 'referrer', { get: function(){ return '${PROXY_ORIGIN}/'; }, configurable: false });
-    } catch(e){}
-
-  } catch(err) {
-    console.warn('[AntiDetect]', err);
-  }
-})();
-<\/script>`;
 }
