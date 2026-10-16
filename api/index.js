@@ -1,72 +1,44 @@
 export default {
   async fetch(request, env, ctx) {
-    // 0. Xử lý ngay lập tức CORS Preflight (OPTIONS) để không bị treo khi bấm nút/gọi API
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         status: 204,
         headers: {
-          'Access-Control-Allow-Origin': request.headers.get('Origin') || '*',
+          'Access-Control-Allow-Origin': '*',
           'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, OPTIONS',
-          'Access-Control-Allow-Headers': request.headers.get('Access-Control-Request-Headers') || '*',
-          'Access-Control-Allow-Credentials': 'true',
-          'Access-Control-Max-Age': '86400'
+          'Access-Control-Allow-Headers': '*',
+          'Access-Control-Allow-Credentials': 'true'
         }
       });
     }
 
-    const baseDomain = 'k12online.vn';
     const url = new URL(request.url);
-    const proxyDomain = url.origin;
+    const proxyDomain = url.origin; // Domain trung gian của bạn (giữ cố định ở đây)
     
-    // 1. Xác định tenant từ cookie
-    let targetHost = baseDomain;
-    const cookieHeader = request.headers.get('cookie') || '';
-    const match = cookieHeader.match(/tenant_host=([^;]+)/);
-    if (match) targetHost = match[1];
-
+    // ĐỊNH NGHĨA DOMAIN GỐC (TARGET THỰC TẾ)
+    // Bạn có thể linh hoạt đổi targetDomain ở đây mà không làm thay đổi proxyDomain bên ngoài
+    let targetHost = 'k12online.vn'; 
     const targetDomain = 'https://' + targetHost;
     
-    // DANH SÁCH LOẠI TRỪ: Không coi các thư mục hệ thống/tài nguyên là tenantPrefix
-    const reservedPrefixes = [
-      'api', 'assets', 'static', 'public', 'css', 'js', 'images', 'img', 
-      'fonts', 'media', 'upload', 'uploads', 'storage', 'build', 'dist', 
-      'vendor', 'plugins', 'themes', 'favicon.ico', 'robots.txt'
-    ];
-    
-    const prefixMatch = url.pathname.match(/^\/([a-zA-Z0-9-]+)(?=\/)/);
-    let tenantPrefix = '';
-    if (prefixMatch && !reservedPrefixes.includes(prefixMatch[1].toLowerCase())) {
-      tenantPrefix = '/' + prefixMatch[1];
-    }
-    
-    // Đường dẫn thực tế gửi đi server gốc
-    let targetPath = url.pathname;
-    if (tenantPrefix && targetPath.startsWith(tenantPrefix)) {
-      targetPath = targetPath.substring(tenantPrefix.length);
-    }
-    if (!targetPath.startsWith('/')) targetPath = '/' + targetPath;
-    
-    const targetUrl = targetDomain + targetPath + url.search;
+    const targetUrl = targetDomain + url.pathname + url.search;
 
     try {
-      // 2. Chuẩn bị Request gửi đi
       const newHeaders = new Headers(request.headers);
       const headersToRemove = [
         'host', 'referer', 'accept-encoding', 'x-forwarded-host',
         'x-forwarded-proto', 'x-forwarded-for', 'x-real-ip',
-        'cf-connecting-ip', 'cf-ray', 'cf-visitor', 'sec-fetch-site',
-        'sec-fetch-mode', 'sec-fetch-dest'
+        'cf-connecting-ip', 'cf-ray', 'cf-visitor', 'sec-fetch-site'
       ];
       headersToRemove.forEach(h => newHeaders.delete(h));
       
       newHeaders.set('Host', targetHost);
       newHeaders.set('Origin', targetDomain);
-      newHeaders.set('Referer', targetDomain + targetPath);
+      newHeaders.set('Referer', targetDomain + '/');
 
       const fetchInit = {
         method: request.method,
         headers: newHeaders,
-        redirect: 'manual'
+        redirect: 'manual' // Bắt giữ mọi lệnh redirect của web gốc để giữ người dùng ở lại domain trung gian
       };
 
       if (request.method !== 'GET' && request.method !== 'HEAD') {
@@ -76,169 +48,125 @@ export default {
       const response = await fetch(targetUrl, fetchInit);
       const responseHeaders = new Headers(response.headers);
       
-      // Xóa các header bảo mật chặn proxy
+      // Xóa các header gây chặn khung hình hoặc chống nhúng
       const headersToDrop = [
         'content-encoding', 'content-length', 'transfer-encoding', 'connection',
         'content-security-policy', 'content-security-policy-report-only',
-        'x-frame-options', 'strict-transport-security', 'report-to', 'nel'
+        'x-frame-options', 'strict-transport-security', 'report-to'
       ];
       headersToDrop.forEach(h => responseHeaders.delete(h));
 
-      // Cấu hình CORS chuẩn (Hỗ trợ gửi kèm Cookie/Session khi bấm nút)
-      const reqOrigin = request.headers.get('Origin');
-      responseHeaders.set('Access-Control-Allow-Origin', reqOrigin || '*');
+      responseHeaders.set('Access-Control-Allow-Origin', '*');
       responseHeaders.set('Access-Control-Allow-Credentials', 'true');
-      responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
 
-      // 3. XỬ LÝ COOKIE (Cho phép JS đọc và gửi cookie mượt mà)
+      // Xử lý cookie để giữ phiên đăng nhập không bị đá văng
       const rawCookies = response.headers.getSetCookie ? response.headers.getSetCookie() : [];
-      responseHeaders.delete('set-cookie'); // Xóa bộ cũ để ghi lại bộ đã dọn sạch
+      responseHeaders.delete('set-cookie');
       const cookiesToSet = [];
-
-      if (rawCookies.length > 0) {
-        for (const cookie of rawCookies) {
-          let cleanCookie = cookie
-            .replace(/Domain=[^;]+;?\s*/ig, '')
-            .replace(/SameSite=[^;]+;?\s*/ig, ''); // Tránh lỗi chặn cookie chéo trang
-          
-          if (!cleanCookie.toLowerCase().includes('path=')) {
-            cleanCookie += '; Path=/';
-          } else {
-            // Ép mọi Path của cookie về gốc '/' để không bị mất phiên khi đổi URL
-            cleanCookie = cleanCookie.replace(/Path=[^;]+/i, 'Path=/');
-          }
-          cookiesToSet.push(cleanCookie.trim());
+      for (const cookie of rawCookies) {
+        let cleanCookie = cookie
+          .replace(/Domain=[^;]+;?\s*/ig, '')
+          .replace(/SameSite=[^;]+;?\s*/ig, '; SameSite=Lax');
+        if (!cleanCookie.toLowerCase().includes('path=')) {
+          cleanCookie += '; Path=/';
         }
+        cookiesToSet.push(cleanCookie.trim());
       }
 
-      // 4. XỬ LÝ REDIRECT
+      // Xử lý Redirect (Nếu web gốc cố tình redirect sang domain khác, ta bẻ lái nó về domain trung gian)
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get('location');
         if (location) {
           let locUrl;
           try { locUrl = new URL(location, targetDomain); } catch (e) { locUrl = null; }
 
-          if (locUrl && locUrl.hostname.includes(baseDomain)) {
-            let newPath = locUrl.pathname + locUrl.search;
-            
-            if (tenantPrefix && !newPath.startsWith(tenantPrefix)) {
-              newPath = tenantPrefix + newPath;
-            }
-
-            if (locUrl.hostname !== targetHost) {
-              // Không để HttpOnly để client script có thể đồng bộ nếu cần
-              cookiesToSet.push(`tenant_host=${locUrl.hostname}; Path=/; Max-Age=86400`);
-            }
-            
-            cookiesToSet.forEach(c => responseHeaders.append('Set-Cookie', c));
-            responseHeaders.set('Location', proxyDomain + newPath);
-            
+          if (locUrl) {
+            // Thay vì để nó bay sang domain mới, ép nó ở lại proxyDomain của bạn
+            const redirectedPath = locUrl.pathname + locUrl.search;
+            responseHeaders.set('Location', proxyDomain + redirectedPath);
             return new Response(null, { status: response.status, headers: responseHeaders });
           }
         }
       }
 
-      // 5. XỬ LÝ NỘI DUNG (Phân loại rõ HTML với JS/JSON/CSS)
       const contentType = (response.headers.get('content-type') || '').toLowerCase();
       const isHtml = contentType.includes('text/html') || contentType.includes('application/xhtml');
-      const isText = isHtml || 
-                     contentType.includes('javascript') || 
-                     contentType.includes('text/css') || 
-                     contentType.includes('application/json');
 
-      if (isText) {
+      if (isHtml) {
         let text = await response.text();
-        let foundTenant = targetHost;
 
-        // A. Thay thế URL tuyệt đối của k12online sang proxyDomain (Áp dụng cho cả HTML, JS, JSON, CSS)
-        const regexSub = new RegExp(`https?://([a-zA-Z0-9-]+)\\.${baseDomain.replace(/\./g, '\\.')}`, 'g');
-        text = text.replace(regexSub, (match, subdomain) => {
-          foundTenant = subdomain + '.' + baseDomain;
-          return proxyDomain;
-        });
-
-        const regexRoot = new RegExp(`https?://${baseDomain.replace(/\./g, '\\.')}`, 'g');
+        // Thay thế toàn bộ link tuyệt đối từ web gốc thành domain trung gian
+        const regexRoot = new RegExp(`https?://${targetHost.replace(/\./g, '\\.')}`, 'g');
         text = text.replace(regexRoot, proxyDomain);
 
-        if (foundTenant && foundTenant !== targetHost) {
-          cookiesToSet.push(`tenant_host=${foundTenant}; Path=/; Max-Age=86400`);
-        }
+        // ==========================================
+        // SCRIPT CHỐNG ANTI-RETURN & BẢO VỆ PHIÊN
+        // ==========================================
+        const antiDetectScript = `<script>
+        (function() {
+          try {
+            // 1. Vô hiệu hóa Anti-Return / Visibility Detector (Chống phát hiện thoát tab/trình duyệt)
+            Object.defineProperty(document, 'hidden', { value: false, writable: false });
+            Object.defineProperty(document, 'visibilityState', { value: 'visible', writable: false });
+            Object.defineProperty(document, 'webkitHidden', { value: false, writable: false });
+            Object.defineProperty(document, 'webkitVisibilityState', { value: 'visible', writable: false });
 
-        // B. CHỈ CAN THIỆP DOM & INJECT SCRIPT NẾU LÀ FILE HTML! (Fix triệt để lỗi đơ/lag JS)
-        if (isHtml) {
-          if (tenantPrefix) {
-            text = text.replace(/(href|src|action|data-src|data-href)=(["'])(\/[^"']*)/gi, (match, attr, quote, path) => {
-              if (path.startsWith(tenantPrefix) || path.startsWith('//')) return match;
-              // Kiểm tra nếu là thư mục tài nguyên tĩnh thì không gắn tenantPrefix
-              const firstSeg = path.split('/')[1]?.toLowerCase();
-              if (reservedPrefixes.includes(firstSeg)) return match;
-              return `${attr}=${quote}${tenantPrefix}${path}`;
+            // Chặn các sự kiện blur, visibilitychange, mouseleave, pagehide khiến web biết bạn rời đi
+            const blockEvents = ['visibilitychange', 'webkitvisibilitychange', 'blur', 'mouseleave', 'pagehide'];
+            blockEvents.forEach(evt => {
+              window.addEventListener(evt, function(e) {
+                e.stopImmediatePropagation();
+              }, true);
+              document.addEventListener(evt, function(e) {
+                e.stopImmediatePropagation();
+              }, true);
             });
-          }
 
-          // Script tiêm vào HTML: Bọc lại Fetch & XHR để các nút bấm gọi đúng địa chỉ Proxy
-          const spoofScript = `<script>
-          (function() {
-            try {
-              const realHost = '${targetHost}';
-              const baseDomain = '${baseDomain}';
-              const proxyOrigin = window.location.origin;
-
-              if (navigator.serviceWorker) {
-                navigator.serviceWorker.register = function() { return Promise.resolve(); };
-              }
-
-              // Hàm chuyển đổi URL gọi ngầm của K12Online về Proxy
-              function rewriteUrl(url) {
-                if (typeof url !== 'string') return url;
-                if (url.includes(baseDomain)) {
-                  return url.replace(/https?:\\/\\/[a-zA-Z0-9.-]*k12online\\.vn/g, proxyOrigin);
+            // Ghi đè phương thức gửi tín hiệu ngầm (Beacon/Fetch tracking thoát trang)
+            if (navigator.sendBeacon) {
+              const origBeacon = navigator.sendBeacon;
+              navigator.sendBeacon = function(url, data) {
+                // Có thể chặn hoặc lọc các URL báo cáo thoát trang tại đây nếu muốn
+                if (url && (url.includes('track') || url.includes('analytics') || url.includes('log'))) {
+                  return true; // Báo cáo giả là thành công nhưng không gửi đi
                 }
-                return url;
+                return origBeacon.call(this, url, data);
+              };
+            }
+
+            // 2. Ép Fetch & XHR luôn bám trụ vào Proxy Domain
+            const proxyOrigin = '${proxyDomain}';
+            const originalFetch = window.fetch;
+            window.fetch = function(input, init) {
+              if (typeof input === 'string' && input.startsWith('http')) {
+                // Nếu gọi API ra ngoài, điều hướng về proxy nếu cần
+                input = input.replace(/https?:\\/\\/[a-zA-Z0-9.-]+/, proxyOrigin);
               }
+              return originalFetch.call(this, input, init);
+            };
 
-              // 1. Bọc lại hàm fetch() để nút bấm hoạt động
-              const originalFetch = window.fetch;
-              window.fetch = function(input, init) {
-                if (typeof input === 'string') {
-                  input = rewriteUrl(input);
-                } else if (input instanceof Request) {
-                  input = new Request(rewriteUrl(input.url), input);
-                }
-                return originalFetch.call(this, input, init);
-              };
+          } catch(e) { console.warn('Anti-detection bypass error:', e); }
+        })();
+        <\/script>`;
 
-              // 2. Bọc lại XMLHttpRequest (Ajax) cho các nút bấm đời cũ
-              const originalOpen = XMLHttpRequest.prototype.open;
-              XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-                return originalOpen.call(this, method, rewriteUrl(url), ...rest);
-              };
-
-            } catch(e) { console.warn('Proxy helper error:', e); }
-          })();
-          <\/script>`;
-
-          // Chỉ chèn vào <head> hoặc <body> của HTML, tuyệt đối không dùng nhánh else nối bừa bãi
-          if (text.includes('<head>')) {
-            text = text.replace('<head>', '<head>' + spoofScript);
-          } else if (text.includes('<body>')) {
-            text = text.replace('<body>', '<body>' + spoofScript);
-          }
-
-          // Xóa Meta Refresh gây chuyển trang mất kiểm soát
-          text = text.replace(/<meta\s+[^>]*http-equiv=["']refresh["'][^>]*>/gi, '');
+        if (text.includes('<head>')) {
+          text = text.replace('<head>', '<head>' + antiDetectScript);
+        } else if (text.includes('<body>')) {
+          text = text.replace('<body>', '<body>' + antiDetectScript);
         }
+
+        // Xóa sạch thẻ Meta Refresh tự chuyển trang độc hại
+        text = text.replace(/<meta\s+[^>]*http-equiv=["']refresh["'][^>]*>/gi, '');
 
         cookiesToSet.forEach(c => responseHeaders.append('Set-Cookie', c));
         return new Response(text, { status: response.status, headers: responseHeaders });
       }
 
-      // 6. TRẢ FILE NHỊ PHÂN
       cookiesToSet.forEach(c => responseHeaders.append('Set-Cookie', c));
       return new Response(response.body, { status: response.status, headers: responseHeaders });
 
     } catch (err) {
-      return new Response(JSON.stringify({ error: 'Proxy error', details: err.message }), {
+      return new Response(JSON.stringify({ error: 'Proxy Gateway Error', details: err.message }), {
         status: 500,
         headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
       });
