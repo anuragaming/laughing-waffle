@@ -2,17 +2,15 @@
 "use strict";
 
 const https = require("https");
-const http = require("http");
 
 const TIMEOUT = 20000;
-const MAX_REDIRECTS = 0;
 
 const METHODS = new Set([
-  "GET", "HEAD", "POST", "PUT",
-  "PATCH", "DELETE", "OPTIONS"
+  "GET", "HEAD", "POST",
+  "PUT", "PATCH", "DELETE", "OPTIONS"
 ]);
 
-function json(res, status, data) {
+function sendJSON(res, status, data) {
   res.statusCode = status;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Cache-Control", "no-store");
@@ -24,30 +22,40 @@ function getTarget() {
 
   if (!value) throw new Error("TARGET_ORIGIN missing");
 
-  const url = new URL(value);
+  const target = new URL(value);
 
-  if (url.protocol !== "https:") {
+  if (target.protocol !== "https:") {
     throw new Error("HTTPS required");
   }
-
-  return url;
-}
-
-function getPath(req, base) {
-  const incoming = new URL(req.url, "https://internal.invalid");
-  const path = incoming.pathname.replace(/^\/api(?=\/|$)/, "") || "/";
-
-  const target = new URL(base.origin);
-
-  target.pathname =
-    base.pathname.replace(/\/$/, "") + path;
-
-  target.search = incoming.search;
 
   return target;
 }
 
-function requestHeaders(req, target) {
+function resolveURL(req, base) {
+  const incoming = new URL(
+    req.url,
+    "https://internal.invalid"
+  );
+
+  let pathname = incoming.pathname;
+
+  if (pathname === "/api") {
+    pathname = "/";
+  } else if (pathname.startsWith("/api/")) {
+    pathname = pathname.slice(4);
+  }
+
+  const destination = new URL(base.origin);
+
+  destination.pathname =
+    base.pathname.replace(/\/$/, "") + pathname;
+
+  destination.search = incoming.search;
+
+  return destination;
+}
+
+function buildHeaders(req, destination) {
   const headers = {};
 
   const allowed = [
@@ -67,42 +75,43 @@ function requestHeaders(req, target) {
     }
   }
 
-  headers.host = target.host;
+  headers.host = destination.host;
 
   return headers;
 }
 
 function proxy(req, res, base) {
   return new Promise((resolve) => {
-    const target = getPath(req, base);
+    const destination = resolveURL(req, base);
 
-    const transport = target.protocol === "https:"
-      ? https
-      : http;
-
-    const upstream = transport.request({
-      hostname: target.hostname,
-      port: target.port || undefined,
-      path: target.pathname + target.search,
+    const upstream = https.request({
+      hostname: destination.hostname,
+      port: destination.port || 443,
+      path: destination.pathname + destination.search,
       method: req.method,
-      headers: requestHeaders(req, target),
+      headers: buildHeaders(req, destination),
       timeout: TIMEOUT
     }, (response) => {
       res.statusCode = response.statusCode || 502;
 
-      const excluded = new Set([
+      const excluded = [
         "connection",
         "transfer-encoding",
         "keep-alive"
-      ]);
+      ];
 
       for (const [key, value] of Object.entries(response.headers)) {
-        if (value !== undefined && !excluded.has(key.toLowerCase())) {
+        if (
+          value !== undefined &&
+          !excluded.includes(key.toLowerCase())
+        ) {
           res.setHeader(key, value);
         }
       }
 
-      res.setHeader("X-Content-Type-Options", "nosniff");
+      response.pipe(res);
+
+      response.on("end", resolve);
 
       response.on("error", (error) => {
         console.error("Response error:", error.message);
@@ -110,8 +119,6 @@ function proxy(req, res, base) {
         resolve();
       });
 
-      response.pipe(res);
-      response.on("end", resolve);
       res.on("close", resolve);
     });
 
@@ -120,17 +127,13 @@ function proxy(req, res, base) {
     });
 
     upstream.on("error", (error) => {
-      console.error("Upstream error:", error.message);
+      console.error("Proxy error:", error.message);
 
       if (!res.headersSent) {
-        json(
+        sendJSON(
           res,
           error.message === "UPSTREAM_TIMEOUT" ? 504 : 502,
-          {
-            error: error.message === "UPSTREAM_TIMEOUT"
-              ? "Gateway timeout"
-              : "Upstream unavailable"
-          }
+          { error: error.message }
         );
       } else {
         res.destroy(error);
@@ -154,7 +157,7 @@ function proxy(req, res, base) {
 module.exports = async function handler(req, res) {
   try {
     if (!METHODS.has(req.method)) {
-      return json(res, 405, {
+      return sendJSON(res, 405, {
         error: "Method not allowed"
       });
     }
@@ -165,9 +168,10 @@ module.exports = async function handler(req, res) {
     ).pathname;
 
     if (pathname === "/health") {
-      return json(res, 200, {
+      return sendJSON(res, 200, {
         status: "ok",
         service: "laughing-waffle",
+        version: "3.0.0",
         runtime: "nodejs",
         timestamp: new Date().toISOString()
       });
@@ -186,7 +190,7 @@ module.exports = async function handler(req, res) {
     console.error("Handler error:", error);
 
     if (!res.headersSent) {
-      json(res, 500, {
+      sendJSON(res, 500, {
         error: "Internal Server Error"
       });
     } else {
