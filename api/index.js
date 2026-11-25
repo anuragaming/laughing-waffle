@@ -4,228 +4,132 @@
 const https = require("https");
 const http = require("http");
 
-const TARGET_ORIGIN = process.env.TARGET_ORIGIN;
-const APP_ORIGIN = process.env.APP_ORIGIN || "";
 const TIMEOUT = 20000;
+const MAX_REDIRECTS = 0;
 
-const ALLOWED_METHODS = new Set([
-  "GET",
-  "HEAD",
-  "POST",
-  "PUT",
-  "PATCH",
-  "DELETE",
-  "OPTIONS"
+const METHODS = new Set([
+  "GET", "HEAD", "POST", "PUT",
+  "PATCH", "DELETE", "OPTIONS"
 ]);
 
-function sendJSON(res, status, data) {
+function json(res, status, data) {
   res.statusCode = status;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Cache-Control", "no-store");
   res.end(JSON.stringify(data));
 }
 
-function validateTarget() {
-  if (!TARGET_ORIGIN) {
-    throw new Error("TARGET_ORIGIN is missing");
-  }
+function getTarget() {
+  const value = process.env.TARGET_ORIGIN;
 
-  const target = new URL(TARGET_ORIGIN);
+  if (!value) throw new Error("TARGET_ORIGIN missing");
 
-  if (!["https:", "http:"].includes(target.protocol)) {
-    throw new Error("Invalid target protocol");
-  }
+  const url = new URL(value);
 
-  // Production should use HTTPS.
-  if (
-    process.env.NODE_ENV === "production" &&
-    target.protocol !== "https:"
-  ) {
+  if (url.protocol !== "https:") {
     throw new Error("HTTPS required");
   }
+
+  return url;
+}
+
+function getPath(req, base) {
+  const incoming = new URL(req.url, "https://internal.invalid");
+  const path = incoming.pathname.replace(/^\/api(?=\/|$)/, "") || "/";
+
+  const target = new URL(base.origin);
+
+  target.pathname =
+    base.pathname.replace(/\/$/, "") + path;
+
+  target.search = incoming.search;
 
   return target;
 }
 
-function checkOrigin(req) {
-  const origin = req.headers.origin;
+function requestHeaders(req, target) {
+  const headers = {};
 
-  // Direct navigation does not always include Origin.
-  if (!origin) return true;
-
-  if (!APP_ORIGIN) return false;
-
-  try {
-    return new URL(origin).origin === new URL(APP_ORIGIN).origin;
-  } catch {
-    return false;
-  }
-}
-
-function getPath(req, target) {
-  const incoming = new URL(
-    req.url,
-    "https://internal.invalid"
-  );
-
-  const prefix = "/api";
-
-  let pathname = incoming.pathname;
-
-  if (pathname === prefix) {
-    pathname = "/";
-  } else if (pathname.startsWith(prefix + "/")) {
-    pathname = pathname.slice(prefix.length);
-  }
-
-  const result = new URL(target.origin);
-
-  result.pathname =
-    target.pathname.replace(/\/$/, "") + pathname;
-
-  result.search = incoming.search;
-
-  return result;
-}
-
-function cleanRequestHeaders(headers, target) {
-  const result = { ...headers };
-
-  const blocked = [
-    "host",
-    "connection",
-    "transfer-encoding",
-    "upgrade",
-    "proxy-authorization",
-    "proxy-authenticate",
-    "x-forwarded-host",
-    "x-real-ip"
+  const allowed = [
+    "accept",
+    "accept-language",
+    "content-type",
+    "content-length",
+    "authorization",
+    "if-none-match",
+    "if-modified-since",
+    "range"
   ];
 
-  for (const name of blocked) {
-    delete result[name];
+  for (const key of allowed) {
+    if (req.headers[key]) {
+      headers[key] = req.headers[key];
+    }
   }
 
-  result.host = target.host;
+  headers.host = target.host;
 
-  return result;
+  return headers;
 }
 
-function cleanResponseHeaders(headers) {
-  const result = { ...headers };
-
-  const blocked = [
-    "connection",
-    "transfer-encoding",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "upgrade",
-    "trailer"
-  ];
-
-  for (const name of blocked) {
-    delete result[name];
-  }
-
-  return result;
-}
-
-function handleHealth(req, res) {
-  sendJSON(res, 200, {
-    status: "ok",
-    service: "laughing-waffle",
-    runtime: "nodejs",
-    timestamp: new Date().toISOString(),
-    targetConfigured: Boolean(TARGET_ORIGIN)
-  });
-}
-
-function proxyRequest(req, res, target) {
+function proxy(req, res, base) {
   return new Promise((resolve) => {
-    const destination = getPath(req, target);
+    const target = getPath(req, base);
 
-    const transport =
-      destination.protocol === "https:"
-        ? https
-        : http;
+    const transport = target.protocol === "https:"
+      ? https
+      : http;
 
-    const options = {
-      protocol: destination.protocol,
-      hostname: destination.hostname,
-      port: destination.port || undefined,
-      path: destination.pathname + destination.search,
+    const upstream = transport.request({
+      hostname: target.hostname,
+      port: target.port || undefined,
+      path: target.pathname + target.search,
       method: req.method,
-      headers: cleanRequestHeaders(req.headers, destination),
+      headers: requestHeaders(req, target),
       timeout: TIMEOUT
-    };
+    }, (response) => {
+      res.statusCode = response.statusCode || 502;
 
-    const upstream = transport.request(
-      options,
-      (response) => {
-        if (res.headersSent) {
-          response.destroy();
-          return resolve();
+      const excluded = new Set([
+        "connection",
+        "transfer-encoding",
+        "keep-alive"
+      ]);
+
+      for (const [key, value] of Object.entries(response.headers)) {
+        if (value !== undefined && !excluded.has(key.toLowerCase())) {
+          res.setHeader(key, value);
         }
-
-        res.statusCode = response.statusCode || 502;
-
-        const headers = cleanResponseHeaders(
-          response.headers
-        );
-
-        for (const [key, value] of Object.entries(headers)) {
-          if (value !== undefined) {
-            res.setHeader(key, value);
-          }
-        }
-
-        // Do not rewrite authentication redirects.
-        // External authentication must be configured
-        // by the upstream application itself.
-
-        response.on("error", (error) => {
-          console.error("Upstream response error:", error.message);
-
-          if (!res.headersSent) {
-            sendJSON(res, 502, {
-              error: "Upstream response failed"
-            });
-          } else {
-            res.destroy(error);
-          }
-        });
-
-        response.pipe(res);
-
-        response.on("end", resolve);
-        res.on("close", resolve);
       }
-    );
 
-    upstream.on("timeout", () => {
-      upstream.destroy(
-        new Error("UPSTREAM_TIMEOUT")
-      );
+      res.setHeader("X-Content-Type-Options", "nosniff");
+
+      response.on("error", (error) => {
+        console.error("Response error:", error.message);
+        res.destroy(error);
+        resolve();
+      });
+
+      response.pipe(res);
+      response.on("end", resolve);
+      res.on("close", resolve);
+    });
+
+    upstream.setTimeout(TIMEOUT, () => {
+      upstream.destroy(new Error("UPSTREAM_TIMEOUT"));
     });
 
     upstream.on("error", (error) => {
-      console.error("Upstream request error:", {
-        message: error.message,
-        target: destination.origin
-      });
+      console.error("Upstream error:", error.message);
 
       if (!res.headersSent) {
-        sendJSON(
+        json(
           res,
-          error.message === "UPSTREAM_TIMEOUT"
-            ? 504
-            : 502,
+          error.message === "UPSTREAM_TIMEOUT" ? 504 : 502,
           {
-            error:
-              error.message === "UPSTREAM_TIMEOUT"
-                ? "Gateway timeout"
-                : "Upstream unavailable"
+            error: error.message === "UPSTREAM_TIMEOUT"
+              ? "Gateway timeout"
+              : "Upstream unavailable"
           }
         );
       } else {
@@ -235,68 +139,55 @@ function proxyRequest(req, res, target) {
       resolve();
     });
 
-    if (req.method === "GET" || req.method === "HEAD") {
+    if (["GET", "HEAD"].includes(req.method)) {
       upstream.end();
     } else {
       req.pipe(upstream);
     }
 
     res.on("close", () => {
-      if (!upstream.destroyed) {
-        upstream.destroy();
-      }
+      if (!upstream.destroyed) upstream.destroy();
     });
   });
 }
 
 module.exports = async function handler(req, res) {
   try {
+    if (!METHODS.has(req.method)) {
+      return json(res, 405, {
+        error: "Method not allowed"
+      });
+    }
+
     const pathname = new URL(
       req.url,
       "https://internal.invalid"
     ).pathname;
 
-    // Health check
     if (pathname === "/health") {
-      return handleHealth(req, res);
-    }
-
-    // Method validation
-    if (!ALLOWED_METHODS.has(req.method)) {
-      return sendJSON(res, 405, {
-        error: "Method not allowed"
+      return json(res, 200, {
+        status: "ok",
+        service: "laughing-waffle",
+        runtime: "nodejs",
+        timestamp: new Date().toISOString()
       });
     }
 
-    // CORS / origin validation
-    if (!checkOrigin(req)) {
-      return sendJSON(res, 403, {
-        error: "Origin not allowed"
-      });
-    }
-
-    // Preflight
     if (req.method === "OPTIONS") {
       res.statusCode = 204;
       return res.end();
     }
 
-    // Target validation
-    const target = validateTarget();
+    const target = getTarget();
 
-    // Proxy
-    await proxyRequest(req, res, target);
+    await proxy(req, res, target);
 
   } catch (error) {
-    console.error("Function error:", error);
+    console.error("Handler error:", error);
 
     if (!res.headersSent) {
-      sendJSON(res, 500, {
-        error: "Internal Server Error",
-        message:
-          process.env.NODE_ENV === "production"
-            ? "Check Vercel Function Logs"
-            : error.message
+      json(res, 500, {
+        error: "Internal Server Error"
       });
     } else {
       res.destroy(error);
