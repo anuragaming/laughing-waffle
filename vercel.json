@@ -2,6 +2,10 @@
 {
   "rewrites": [
     {
+      "source": "/health",
+      "destination": "/api"
+    },
+    {
       "source": "/(.*)",
       "destination": "/api"
     }
