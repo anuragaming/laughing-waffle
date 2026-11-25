@@ -10,37 +10,74 @@ const METHODS = new Set([
   "PUT", "PATCH", "DELETE", "OPTIONS"
 ]);
 
-const REWRITABLE = /^(text\/html|text\/css|application\/javascript|text\/javascript|application\/x-javascript|application\/json|text\/xml|application\/xml)/i;
+// ---------------------------------------------------------------
+// Anti-VISIBILITY: injected at the very top of <head> in HTML pages.
+// Makes the page always believe the tab is visible and focused.
+// ---------------------------------------------------------------
+const ANTI_VISIBILITY_SCRIPT = `<script data-anti-visibility>
+(function () {
+  "use strict";
+  try {
+    function define(obj, key, getter) {
+      try {
+        Object.defineProperty(obj, key, { get: getter, configurable: true });
+      } catch (e) {}
+    }
 
-// Tắt bằng env ANTI_VISIBILITY=0 nếu cần
-const ANTI_VISIBILITY_ON = process.env.ANTI_VISIBILITY !== "0";
+    var proto = Document.prototype;
 
-const ANTI_VISIBILITY = `<script>(function(){try{
-var d=document;
-function def(o,k,v){try{Object.defineProperty(o,k,{get:function(){return v},configurable:true})}catch(e){}}
-def(d,'hidden',false);
-def(d,'webkitHidden',false);
-def(d,'mozHidden',false);
-def(d,'msHidden',false);
-def(d,'visibilityState','visible');
-def(d,'webkitVisibilityState','visible');
-d.hasFocus=function(){return true};
-var block=['visibilitychange','webkitvisibilitychange','blur','pagehide','freeze','resume'];
-function stop(e){
-  if(e.target===window||e.target===d||e.target===d.documentElement){
-    e.stopImmediatePropagation();
-  }
-}
-block.forEach(function(t){
-  window.addEventListener(t,stop,true);
-  d.addEventListener(t,stop,true);
-});
-['onblur','onvisibilitychange','onpagehide'].forEach(function(p){
-  [window,d].forEach(function(o){
-    try{Object.defineProperty(o,p,{get:function(){return null},set:function(){},configurable:true})}catch(e){}
-  });
-});
-}catch(e){}})();</script>`;
+    // Fake visibility state
+    define(proto, "hidden", function () { return false; });
+    define(proto, "visibilityState", function () { return "visible"; });
+    define(proto, "webkitHidden", function () { return false; });
+    define(proto, "webkitVisibilityState", function () { return "visible"; });
+    define(proto, "mozHidden", function () { return false; });
+    define(proto, "msHidden", function () { return false; });
+
+    // Fake focus
+    try {
+      proto.hasFocus = function () { return true; };
+    } catch (e) {}
+
+    // Swallow visibility / focus-loss events before any page listener sees them
+    var events = [
+      "visibilitychange",
+      "webkitvisibilitychange",
+      "mozvisibilitychange",
+      "msvisibilitychange",
+      "blur"
+    ];
+
+    function stop(e) {
+      // Only block window/document level blur, never element blur (forms, inputs)
+      if (e.type === "blur" && e.target !== window && e.target !== document) return;
+      e.stopImmediatePropagation();
+    }
+
+    events.forEach(function (name) {
+      window.addEventListener(name, stop, true);
+      document.addEventListener(name, stop, true);
+    });
+
+    // Block on* handler assignments
+    try {
+      Object.defineProperty(proto, "onvisibilitychange", {
+        get: function () { return null; },
+        set: function () {},
+        configurable: true
+      });
+    } catch (e) {}
+
+    try {
+      Object.defineProperty(window, "onblur", {
+        get: function () { return null; },
+        set: function () {},
+        configurable: true
+      });
+    } catch (e) {}
+  } catch (e) {}
+})();
+</script>`;
 
 function sendJSON(res, status, data) {
   res.statusCode = status;
@@ -51,21 +88,25 @@ function sendJSON(res, status, data) {
 
 function getTarget() {
   const value = process.env.TARGET_ORIGIN;
-  if (!value) throw new Error("TARGET_ORIGIN missing");
+
+  if (!value) {
+    throw new Error("TARGET_ORIGIN_MISSING");
+  }
 
   const target = new URL(value);
-  if (target.protocol !== "https:") throw new Error("HTTPS required");
+
+  if (target.protocol !== "https:") {
+    throw new Error("HTTPS_REQUIRED");
+  }
+
+  if (target.username || target.password) {
+    throw new Error("URL_CREDENTIALS_NOT_ALLOWED");
+  }
 
   return target;
 }
 
-function getProxyOrigin(req) {
-  const proto = (req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
-  const host = (req.headers["x-forwarded-host"] || req.headers.host || "").split(",")[0].trim();
-  return `${proto}://${host}`;
-}
-
-function resolveURL(req, base) {
+function getPath(req, base) {
   const incoming = new URL(req.url, "https://internal.invalid");
 
   let pathname = incoming.pathname;
@@ -76,23 +117,25 @@ function resolveURL(req, base) {
     pathname = pathname.slice(4);
   }
 
-  const destination = new URL(base.origin);
-  destination.pathname = base.pathname.replace(/\/$/, "") + pathname;
+  const destination = new URL(base);
+
+  destination.pathname =
+    base.pathname.replace(/\/+$/, "") +
+    "/" +
+    pathname.replace(/^\/+/, "");
+
   destination.search = incoming.search;
 
   return destination;
 }
 
-function buildHeaders(req, destination, proxyOrigin, base) {
+function buildHeaders(req, destination) {
   const headers = {};
-
   const allowed = [
     "accept",
     "accept-language",
     "content-type",
     "content-length",
-    "authorization",
-    "cookie",
     "user-agent",
     "if-none-match",
     "if-modified-since",
@@ -100,166 +143,179 @@ function buildHeaders(req, destination, proxyOrigin, base) {
   ];
 
   for (const key of allowed) {
-    if (req.headers[key]) headers[key] = req.headers[key];
+    if (req.headers[key] !== undefined) {
+      headers[key] = req.headers[key];
+    }
   }
 
-  if (req.headers.origin) {
-    headers.origin = base.origin;
-  }
-  if (req.headers.referer) {
-    headers.referer = req.headers.referer.replace(proxyOrigin, base.origin);
-  }
-
-  headers["accept-encoding"] = "gzip, deflate, identity";
   headers.host = destination.host;
+  headers["accept-encoding"] = "gzip, deflate, br, identity";
 
   return headers;
 }
 
-function rewriteText(text, base, proxyOrigin) {
-  const host = base.host.replace(/\./g, "\\.");
-  const re = new RegExp(`(https?:)?(\\\\?/\\\\?/)${host}`, "gi");
-  const p = new URL(proxyOrigin);
+function decompress(buffer, encoding) {
+  return new Promise((resolve, reject) => {
+    const methods = {
+      gzip: zlib.gunzip,
+      "x-gzip": zlib.gunzip,
+      deflate: zlib.inflate,
+      br: zlib.brotliDecompress
+    };
 
-  return text.replace(re, (match, proto, slashes) => {
-    return `${proto ? p.protocol : ""}${slashes}${p.host}`;
-  });
-}
+    const method = methods[encoding];
 
-function injectScript(html) {
-  const re = /<head[^>]*>/i;
+    if (!method) {
+      if (!encoding || encoding === "identity") {
+        return resolve(buffer);
+      }
 
-  if (re.test(html)) {
-    return html.replace(re, (m) => m + ANTI_VISIBILITY);
-  }
-
-  return ANTI_VISIBILITY + html;
-}
-
-function rewriteLocation(location, destination, base, proxyOrigin) {
-  try {
-    const abs = new URL(location, destination);
-
-    if (abs.host === base.host) {
-      let path = abs.pathname;
-      const basePath = base.pathname.replace(/\/$/, "");
-      if (basePath && path.startsWith(basePath)) path = path.slice(basePath.length) || "/";
-      return proxyOrigin + path + abs.search + abs.hash;
+      return reject(new Error("UNSUPPORTED_CONTENT_ENCODING"));
     }
 
-    return abs.toString();
-  } catch {
-    return location;
-  }
-}
-
-function rewriteCookie(cookie) {
-  return cookie
-    .replace(/;\s*domain=[^;]*/gi, "")
-    .replace(/;\s*samesite=[^;]*/gi, "; SameSite=Lax");
-}
-
-function decodeBody(buffer, encoding) {
-  return new Promise((resolve, reject) => {
-    if (encoding === "gzip") return zlib.gunzip(buffer, (e, r) => (e ? reject(e) : resolve(r)));
-    if (encoding === "deflate") return zlib.inflate(buffer, (e, r) => (e ? reject(e) : resolve(r)));
-    resolve(buffer);
+    method(buffer, (error, result) => {
+      if (error) return reject(error);
+      resolve(result);
+    });
   });
+}
+
+// Is this response an HTML document we can safely inject into?
+function isInjectableHtml(contentType) {
+  const type = String(contentType || "").toLowerCase();
+
+  if (!type.includes("text/html")) return false;
+
+  const charset = /charset\s*=\s*"?([^;"\s]+)/.exec(type);
+
+  if (charset && !/^utf-?8$/.test(charset[1])) return false;
+
+  return true;
+}
+
+// Insert the script as early as possible: right after <head>,
+// else after <html>, else at the very beginning.
+function injectAntiVisibility(html) {
+  if (html.includes("data-anti-visibility")) return html;
+
+  const head = /<head(\s[^>]*)?>/i.exec(html);
+
+  if (head) {
+    const index = head.index + head[0].length;
+    return html.slice(0, index) + ANTI_VISIBILITY_SCRIPT + html.slice(index);
+  }
+
+  const root = /<html(\s[^>]*)?>/i.exec(html);
+
+  if (root) {
+    const index = root.index + root[0].length;
+    return html.slice(0, index) + ANTI_VISIBILITY_SCRIPT + html.slice(index);
+  }
+
+  return ANTI_VISIBILITY_SCRIPT + html;
 }
 
 function proxy(req, res, base) {
   return new Promise((resolve) => {
-    const destination = resolveURL(req, base);
-    const proxyOrigin = getProxyOrigin(req);
+    const destination = getPath(req, base);
 
     const upstream = https.request({
       hostname: destination.hostname,
       port: destination.port || 443,
       path: destination.pathname + destination.search,
       method: req.method,
-      headers: buildHeaders(req, destination, proxyOrigin, base),
+      headers: buildHeaders(req, destination),
       timeout: TIMEOUT
     }, (response) => {
       const status = response.statusCode || 502;
-      const contentType = String(response.headers["content-type"] || "");
-      const encoding = String(response.headers["content-encoding"] || "").toLowerCase();
-      const isHTML = /^text\/html/i.test(contentType);
-      const shouldRewrite =
-        REWRITABLE.test(contentType) &&
-        status !== 204 && status !== 304 &&
-        req.method !== "HEAD";
-
-      const excluded = new Set([
-        "connection",
-        "transfer-encoding",
-        "keep-alive",
-        "content-security-policy",
-        "content-security-policy-report-only",
-        "strict-transport-security",
-        "x-frame-options"
-      ]);
-
-      if (shouldRewrite) {
-        excluded.add("content-length");
-        excluded.add("content-encoding");
-        excluded.add("etag");
-      }
 
       res.statusCode = status;
 
+      // Forward normal response headers.
       for (const [key, value] of Object.entries(response.headers)) {
-        const k = key.toLowerCase();
-        if (value === undefined || excluded.has(k)) continue;
+        if (value === undefined) continue;
 
-        if (k === "location") {
-          res.setHeader(key, rewriteLocation(String(value), destination, base, proxyOrigin));
-        } else if (k === "set-cookie") {
-          const list = Array.isArray(value) ? value : [value];
-          res.setHeader("Set-Cookie", list.map(rewriteCookie));
-        } else {
-          res.setHeader(key, value);
+        const lower = key.toLowerCase();
+
+        if ([
+          "connection",
+          "transfer-encoding",
+          "keep-alive"
+        ].includes(lower)) {
+          continue;
         }
+
+        // Redirects are passed through unchanged.
+        res.setHeader(key, value);
       }
 
-      if (!shouldRewrite) {
-        response.pipe(res);
+      if (
+        req.method === "HEAD" ||
+        status === 204 ||
+        status === 304
+      ) {
+        response.resume();
         response.on("end", resolve);
-        response.on("error", (error) => {
-          console.error("Response error:", error.message);
-          res.destroy(error);
-          resolve();
-        });
-        res.on("close", resolve);
         return;
       }
 
+      const encoding = String(
+        response.headers["content-encoding"] || ""
+      ).toLowerCase();
+
       const chunks = [];
-      response.on("data", (c) => chunks.push(c));
+
+      response.on("data", chunk => chunks.push(chunk));
 
       response.on("end", async () => {
         try {
-          const raw = await decodeBody(Buffer.concat(chunks), encoding);
-          let body = raw.toString("utf8");
+          const raw = Buffer.concat(chunks);
+          let body = await decompress(raw, encoding);
 
-          body = rewriteText(body, base, proxyOrigin);
+          // Only HTML documents get the Anti-Visibility script.
+          // Scripts, JSON, auth flows and redirects stay untouched.
+          if (
+            status >= 200 &&
+            status < 300 &&
+            status !== 206 &&
+            isInjectableHtml(response.headers["content-type"])
+          ) {
+            body = Buffer.from(
+              injectAntiVisibility(body.toString("utf8")),
+              "utf8"
+            );
 
-          if (isHTML && ANTI_VISIBILITY_ON) {
-            body = injectScript(body);
+            // An upstream CSP would block the inline script.
+            res.removeHeader("content-security-policy");
+            res.removeHeader("content-security-policy-report-only");
+
+            // Body changed, so validators from upstream no longer match.
+            res.removeHeader("etag");
+            res.removeHeader("content-md5");
           }
 
-          const out = Buffer.from(body, "utf8");
-          res.setHeader("Content-Length", out.length);
-          res.end(out);
+          res.removeHeader("content-encoding");
+          res.removeHeader("content-length");
+
+          res.setHeader("Content-Length", body.length);
+          res.end(body);
         } catch (error) {
-          console.error("Rewrite error:", error.message);
-          if (!res.headersSent) sendJSON(res, 502, { error: "REWRITE_FAILED" });
-          else res.destroy(error);
+          console.error("Body processing error:", error.message);
+
+          if (!res.headersSent) {
+            sendJSON(res, 502, {
+              error: "UPSTREAM_BODY_ERROR"
+            });
+          } else {
+            res.destroy(error);
+          }
         }
+
         resolve();
       });
 
-      response.on("error", (error) => {
-        console.error("Response error:", error.message);
+      response.on("error", error => {
+        console.error("Upstream response error:", error.message);
         res.destroy(error);
         resolve();
       });
@@ -271,8 +327,8 @@ function proxy(req, res, base) {
       upstream.destroy(new Error("UPSTREAM_TIMEOUT"));
     });
 
-    upstream.on("error", (error) => {
-      console.error("Proxy error:", error.message);
+    upstream.on("error", error => {
+      console.error("Upstream error:", error.message);
 
       if (!res.headersSent) {
         sendJSON(
@@ -287,14 +343,16 @@ function proxy(req, res, base) {
       resolve();
     });
 
-    if (["GET", "HEAD"].includes(req.method)) {
+    if (req.method === "GET" || req.method === "HEAD") {
       upstream.end();
     } else {
       req.pipe(upstream);
     }
 
     res.on("close", () => {
-      if (!upstream.destroyed) upstream.destroy();
+      if (!upstream.destroyed) {
+        upstream.destroy();
+      }
     });
   });
 }
@@ -302,16 +360,21 @@ function proxy(req, res, base) {
 module.exports = async function handler(req, res) {
   try {
     if (!METHODS.has(req.method)) {
-      return sendJSON(res, 405, { error: "Method not allowed" });
+      return sendJSON(res, 405, {
+        error: "METHOD_NOT_ALLOWED"
+      });
     }
 
-    const pathname = new URL(req.url, "https://internal.invalid").pathname;
+    const pathname = new URL(
+      req.url,
+      "https://internal.invalid"
+    ).pathname;
 
     if (pathname === "/health") {
       return sendJSON(res, 200, {
         status: "ok",
         service: "laughing-waffle",
-        version: "3.2.0",
+        version: "4.1.0",
         runtime: "nodejs",
         timestamp: new Date().toISOString()
       });
@@ -323,13 +386,15 @@ module.exports = async function handler(req, res) {
     }
 
     const target = getTarget();
-    await proxy(req, res, target);
 
+    await proxy(req, res, target);
   } catch (error) {
     console.error("Handler error:", error);
 
     if (!res.headersSent) {
-      sendJSON(res, 500, { error: "Internal Server Error" });
+      sendJSON(res, 500, {
+        error: "INTERNAL_SERVER_ERROR"
+      });
     } else {
       res.destroy(error);
     }
